@@ -53,13 +53,13 @@ function logError(tag, error) {
 
 async function getUniUniToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-  logRequest('AUTH', 'POST', `${UNIUNI_BASE_URL}/storeauth/customertoken`, ...);
+  logRequest('AUTH', 'POST', UNIUNI_BASE_URL + '/storeauth/customertoken', { grant_type: 'client_credentials' });
   try {
-   const r = await axios.post(`${UNIUNI_BASE_URL}/storeauth/customertoken`, {
-  grant_type:    'client_credentials',
-  client_id:     parseInt(UNIUNI_CLIENT_ID, 10),
-  client_secret: UNIUNI_CLIENT_SECRET,
-});
+    const r = await axios.post(UNIUNI_BASE_URL + '/storeauth/customertoken', {
+      grant_type:    'client_credentials',
+      client_id:     parseInt(UNIUNI_CLIENT_ID, 10),
+      client_secret: UNIUNI_CLIENT_SECRET,
+    });
     logResponse('AUTH', r.status, { access_token: '***REDACTED***', expires_in: r.data.expires_in });
     cachedToken = r.data.access_token;
     tokenExpiry  = Date.now() + 55 * 60 * 1000;
