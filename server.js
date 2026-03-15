@@ -53,7 +53,7 @@ function logError(tag, error) {
 
 async function getUniUniToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-  logRequest('AUTH', 'POST', `${UNIUNI_BASE_URL}/oauth/token`, { grant_type: 'client_credentials' });
+  logRequest('AUTH', 'POST', `${UNIUNI_BASE_URL}/storeauth/customertoken`, ...);
   try {
    const r = await axios.post(`${UNIUNI_BASE_URL}/storeauth/customertoken`, {
   grant_type:    'client_credentials',
