@@ -55,14 +55,17 @@ async function getUniUniToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
   logRequest('AUTH', 'POST', UNIUNI_BASE_URL + '/storeauth/customertoken', { grant_type: 'client_credentials' });
   try {
-    const r = await axios.post(UNIUNI_BASE_URL + '/storeauth/customertoken', {
-      grant_type:    'client_credentials',
-      client_id:     parseInt(UNIUNI_CLIENT_ID, 10),
-      client_secret: UNIUNI_CLIENT_SECRET,
+    const params = new URLSearchParams();
+    params.append('grant_type', 'client_credentials');
+    params.append('client_id', UNIUNI_CLIENT_ID);
+    params.append('client_secret', UNIUNI_CLIENT_SECRET);
+
+    const r = await axios.post(UNIUNI_BASE_URL + '/storeauth/customertoken', params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
     logResponse('AUTH', r.status, { access_token: '***REDACTED***', expires_in: r.data.expires_in });
     cachedToken = r.data.access_token;
-    tokenExpiry  = Date.now() + 55 * 60 * 1000;
+    tokenExpiry = Date.now() + 55 * 60 * 1000;
     console.log('[AUTH] UniUni token refreshed successfully');
     return cachedToken;
   } catch (e) { logError('AUTH', e); throw e; }
