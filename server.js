@@ -1,5 +1,5 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.2
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.3
  */
 const express = require('express');
 const axios   = require('axios');
@@ -8,10 +8,10 @@ require('dotenv').config();
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-const UNIUNI_CLIENT_ID      = process.env.UNIUNI_CLIENT_ID;
-const UNIUNI_CLIENT_SECRET  = process.env.UNIUNI_CLIENT_SECRET;
-const UNIUNI_CUSTOMER_NO    = process.env.UNIUNI_CUSTOMER_NO;
-const UNIUNI_WAREHOUSE_ID   = process.env.UNIUNI_WAREHOUSE_ID;   // ← ADD THIS in Railway vars
+const UNIUNI_CLIENT_ID     = process.env.UNIUNI_CLIENT_ID;
+const UNIUNI_CLIENT_SECRET = process.env.UNIUNI_CLIENT_SECRET;
+const UNIUNI_CUSTOMER_NO   = process.env.UNIUNI_CUSTOMER_NO;
+const UNIUNI_WAREHOUSE_ID  = process.env.UNIUNI_WAREHOUSE_ID;
 const PORT = process.env.PORT || 3000;
 
 const UNIUNI_BASE_URL = 'https://prm-api.uniuni.com';
@@ -51,8 +51,6 @@ function logError(tag, error) {
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
-// Uses form-encoded body per UniUni API docs
-// FIX: Token is at r.data.data.access_token (not r.data.access_token)
 
 async function getUniUniToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
@@ -142,7 +140,7 @@ const DEFAULT_FROM = {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.2',
+  version: '1.0.3',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -206,15 +204,18 @@ app.post('/get-rate', async (req, res) => {
         logResponse('GET-RATE', rateRes.status, rateRes.data);
 
         const d = rateRes.data;
-        if (d.status === 'SUCCESS' && d.data?.freight_fee != null) {
+        // FIX: UniUni returns shippingCharge (not freight_fee) and totalAfterTax
+        if (d.status === 'SUCCESS' && d.data) {
+          const cost = parseFloat(d.data.totalAfterTax || d.data.shippingCharge || 0);
           rateList = [{
             carrier:        order.carrier || 'UNIUNI-REG',
             shippingOption: 'STANDARD',
-            totalCost:      parseFloat(d.data.freight_fee || 0),
-            shippingCost:   parseFloat(d.data.freight_fee || 0),
+            totalCost:      cost,
+            shippingCost:   cost,
             otherCost:      0,
-            currency:       'USD',
+            currency:       d.data.currency || 'USD',
           }];
+          console.log('[GET-RATE] Rate: $' + cost + ' zone=' + d.data.zone + ' eta=' + d.data.eta + ' days');
         } else {
           msg = d.ret_msg || 'No rate available';
         }
@@ -487,9 +488,9 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.2 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.3 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
-  console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET - add to Railway vars'));
+  console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
   console.log('   Base URL     : ' + UNIUNI_BASE_URL + '\n');
 });
