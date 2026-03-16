@@ -1,5 +1,5 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.1
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.2
  */
 const express = require('express');
 const axios   = require('axios');
@@ -8,9 +8,10 @@ require('dotenv').config();
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-const UNIUNI_CLIENT_ID     = process.env.UNIUNI_CLIENT_ID;
-const UNIUNI_CLIENT_SECRET = process.env.UNIUNI_CLIENT_SECRET;
-const UNIUNI_CUSTOMER_NO   = process.env.UNIUNI_CUSTOMER_NO;
+const UNIUNI_CLIENT_ID      = process.env.UNIUNI_CLIENT_ID;
+const UNIUNI_CLIENT_SECRET  = process.env.UNIUNI_CLIENT_SECRET;
+const UNIUNI_CUSTOMER_NO    = process.env.UNIUNI_CUSTOMER_NO;
+const UNIUNI_WAREHOUSE_ID   = process.env.UNIUNI_WAREHOUSE_ID;   // ← ADD THIS in Railway vars
 const PORT = process.env.PORT || 3000;
 
 const UNIUNI_BASE_URL = 'https://prm-api.uniuni.com';
@@ -20,8 +21,8 @@ const MIDDLEWARE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
   : (process.env.MIDDLEWARE_URL || 'https://uniuni-logiwa-middleware-production.up.railway.app');
 
 const labelCache = {};
-let cachedToken  = null;
-let tokenExpiry  = 0;
+let cachedToken = null;
+let tokenExpiry = 0;
 
 // ─── LOGGING ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +51,8 @@ function logError(tag, error) {
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
-// FIX: Use form-encoded body (not JSON) per UniUni API docs
+// Uses form-encoded body per UniUni API docs
+// FIX: Token is at r.data.data.access_token (not r.data.access_token)
 
 async function getUniUniToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
@@ -73,8 +75,11 @@ async function getUniUniToken() {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    logResponse('AUTH', r.status, { access_token: '***REDACTED***', expires_in: r.data.expires_in });
-    cachedToken = r.data.access_token;
+    const token = r.data.data.access_token;
+    if (!token) throw new Error('No access_token in auth response: ' + JSON.stringify(r.data));
+
+    logResponse('AUTH', r.status, { access_token: '***REDACTED***', expires_in: r.data.data.expires_in });
+    cachedToken = token;
     tokenExpiry = Date.now() + 55 * 60 * 1000;
     console.log('[AUTH] UniUni token refreshed successfully');
     return cachedToken;
@@ -137,7 +142,8 @@ const DEFAULT_FROM = {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.1',
+  version: '1.0.2',
+  warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
 // ─── LABEL PROXY ──────────────────────────────────────────────────────────────
@@ -168,6 +174,7 @@ app.post('/get-rate', async (req, res) => {
     for (const order of orders) {
       const pkg      = order.requestedPackageLineItems?.[0] || {};
       const shipTo   = getAddr(order.shipTo);
+      const shipFrom = getAddr(order.shipFrom);
       const weightLB = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
       const dims     = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 0);
@@ -175,14 +182,16 @@ app.post('/get-rate', async (req, res) => {
       const h = parseFloat(dims.Height || dims.height || 0);
 
       const rateReq = {
-        customer_no:   parseInt(UNIUNI_CUSTOMER_NO, 10),
-        postal_code:   shipTo.postalCode,
-        weight:        weightLB,
-        weight_uom:    'LBS',
-        length:        l || 13,
-        width:         w || 10,
-        height:        h || 2,
-        dimension_uom: 'IN',
+        customer_no:       parseInt(UNIUNI_CUSTOMER_NO, 10),
+        pickup_warehouse:  parseInt(UNIUNI_WAREHOUSE_ID, 10),
+        start_postal_code: shipFrom.postalCode || DEFAULT_FROM.postalCode,
+        postal_code:       shipTo.postalCode,
+        weight:            weightLB,
+        weight_uom:        'LBS',
+        length:            l || 13,
+        width:             w || 10,
+        height:            h || 2,
+        dimension_uom:     'IN',
       };
 
       logRequest('GET-RATE', 'POST', UNIUNI_BASE_URL + '/orders/estimateshipping', rateReq);
@@ -215,7 +224,6 @@ app.post('/get-rate', async (req, res) => {
         msg = 'UniUni error: ' + (e.response?.data?.ret_msg || e.message);
       }
 
-      // FIX: message must be an array for Logiwa
       out.push({
         shipmentOrderCode:       order.shipmentOrderCode,
         shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -231,7 +239,6 @@ app.post('/get-rate', async (req, res) => {
 
   } catch (err) {
     console.error('[GET-RATE] Fatal:', err.message);
-    // FIX: message must be an array for Logiwa
     return res.json({
       data: parseLogiwaBody(req.body).map(o => ({
         shipmentOrderCode:       o.shipmentOrderCode,
@@ -255,12 +262,12 @@ app.post('/create-label', async (req, res) => {
     const out    = [];
 
     for (const order of orders) {
-      const pkg         = order.requestedPackageLineItems?.[0] || {};
-      const shipTo      = getAddr(order.shipTo);
-      const toContact   = getContact(order.shipTo);
-      const shipFrom    = getAddr(order.shipFrom);
-      const weightLB    = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
-      const dims        = pkg.dimensions || {};
+      const pkg       = order.requestedPackageLineItems?.[0] || {};
+      const shipTo    = getAddr(order.shipTo);
+      const toContact = getContact(order.shipTo);
+      const shipFrom  = getAddr(order.shipFrom);
+      const weightLB  = weightToLB(pkg.weight?.Value || pkg.weight?.value, pkg.weight?.Units || pkg.weight?.units);
+      const dims      = pkg.dimensions || {};
       const l = parseFloat(dims.Length || dims.length || 13);
       const w = parseFloat(dims.Width  || dims.width  || 10);
       const h = parseFloat(dims.Height || dims.height || 2);
@@ -302,9 +309,7 @@ app.post('/create-label', async (req, res) => {
         logResponse('CREATE-LABEL', shipRes.status, shipRes.data);
 
         const d = shipRes.data;
-        if (d.status !== 'SUCCESS') {
-          throw new Error(d.ret_msg || 'UniUni order creation failed');
-        }
+        if (d.status !== 'SUCCESS') throw new Error(d.ret_msg || 'UniUni order creation failed');
 
         const tno      = d.data.tno;
         const order_id = d.data.order_id;
@@ -350,7 +355,6 @@ app.post('/create-label', async (req, res) => {
       } catch (e) {
         logError('CREATE-LABEL', e);
         const em = e.response?.data?.ret_msg || e.message;
-        // FIX: message must be an array for Logiwa
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -378,7 +382,6 @@ app.post('/create-label', async (req, res) => {
   } catch (err) {
     console.error('[CREATE-LABEL] Fatal:', err.message);
     const o = parseLogiwaBody(req.body)[0] || {};
-    // FIX: message must be an array for Logiwa
     return res.json({
       data: [{
         shipmentOrderIdentifier: o.shipmentOrderIdentifier,
@@ -408,13 +411,7 @@ app.post('/void-label', async (req, res) => {
     for (const order of orders) {
       const trk = order.masterTrackingNumber;
       if (!trk) {
-        out.push({
-          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
-          masterTrackingNumber: '',
-          externalReference: '',
-          isSuccessful: false,
-          message: [],
-        });
+        out.push({ shipmentOrderIdentifier: order.shipmentOrderIdentifier, masterTrackingNumber: '', externalReference: '', isSuccessful: false, message: [] });
         continue;
       }
 
@@ -490,8 +487,9 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.1 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.2 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
+  console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET - add to Railway vars'));
   console.log('   Base URL     : ' + UNIUNI_BASE_URL + '\n');
 });
