@@ -214,7 +214,7 @@ app.post('/get-rate', async (req, res) => {
             shippingCost:   cost,
             otherCost:      0,
             currency:       d.data.currency || 'USD',
-            deliveryDays:   eta,
+            transitDays:   eta,
           }];
           console.log('[GET-RATE] Rate: $' + cost + ' zone=' + d.data.zone + ' eta=' + eta + ' days');
         } else {
