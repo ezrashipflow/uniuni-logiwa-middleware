@@ -1,5 +1,5 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.3
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.4
  */
 const express = require('express');
 const axios   = require('axios');
@@ -140,7 +140,7 @@ const DEFAULT_FROM = {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.3',
+  version: '1.0.4',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -204,9 +204,9 @@ app.post('/get-rate', async (req, res) => {
         logResponse('GET-RATE', rateRes.status, rateRes.data);
 
         const d = rateRes.data;
-        // FIX: UniUni returns shippingCharge (not freight_fee) and totalAfterTax
         if (d.status === 'SUCCESS' && d.data) {
           const cost = parseFloat(d.data.totalAfterTax || d.data.shippingCharge || 0);
+          const eta  = parseInt(d.data.eta, 10) || null;
           rateList = [{
             carrier:        order.carrier || 'UNIUNI-REG',
             shippingOption: 'STANDARD',
@@ -214,8 +214,9 @@ app.post('/get-rate', async (req, res) => {
             shippingCost:   cost,
             otherCost:      0,
             currency:       d.data.currency || 'USD',
+            deliveryDays:   eta,
           }];
-          console.log('[GET-RATE] Rate: $' + cost + ' zone=' + d.data.zone + ' eta=' + d.data.eta + ' days');
+          console.log('[GET-RATE] Rate: $' + cost + ' zone=' + d.data.zone + ' eta=' + eta + ' days');
         } else {
           msg = d.ret_msg || 'No rate available';
         }
@@ -488,7 +489,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.3 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.4 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
