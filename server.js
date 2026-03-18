@@ -1,10 +1,9 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.5
- * Changes from v1.0.4:
- *   - trace_no set to blank so UniUni generates real tno (fixes order code printing as tracking #)
- *   - reference mapped to labelReferences.reference1 (OrderCode)
- *   - custom_field.label_text1 mapped to labelReferences.reference2 (StoreOrderNumber)
- *   - custom_field.label_text2 hardcoded to labelReferences.reference2 (swap via Logiwa when ready)
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.6
+ * Changes from v1.0.5:
+ *   - custom_field keys renamed to LBL-Ref1 and LBL-Ref2 (clean, neutral names)
+ *   - reference field set to blank (doesn't print on label reliably)
+ *   - void endpoint corrected to /orders/cancelorder
  */
 const express = require('express');
 const axios   = require('axios');
@@ -145,7 +144,7 @@ const DEFAULT_FROM = {
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.5',
+  version: '1.0.6',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -279,19 +278,16 @@ app.post('/create-label', async (req, res) => {
       const w = parseFloat(dims.Width  || dims.width  || 10);
       const h = parseFloat(dims.Height || dims.height || 2);
 
-      // ─── Label reference field mapping ────────────────────────────────────
-      // reference1 = OrderCode (Logiwa Label Messages 1)
-      // reference2 = StoreOrderNumber (Logiwa Label Messages 2)
+      // ─── Label reference mapping ───────────────────────────────────────────
+      // ref1 = Logiwa Label Messages 1 (e.g. OrderCode)
+      // ref2 = Logiwa Label Messages 2 (e.g. StoreOrderNumber, ClientName, etc.)
       const ref1 = pkg.labelReferences?.reference1 || order.shipmentOrderCode || '';
       const ref2 = pkg.labelReferences?.reference2 || '';
 
       const shipReq = {
         customer_no:       parseInt(UNIUNI_CUSTOMER_NO, 10),
-        // FIX: blank trace_no so UniUni auto-generates real tno
-        // (previously set to shipmentOrderCode which caused it to print as tracking #)
-        trace_no:          '',
-        // reference maps to "Reference #:" line on label
-        reference:         ref1,
+        trace_no:          '',        // blank → UniUni generates real tno
+        reference:         '',        // blank → not used for label display
         pickup_address:    buildFullAddress({
           address1:   shipFrom.address1   || DEFAULT_FROM.address1,
           address2:   shipFrom.address2   || '',
@@ -312,12 +308,12 @@ app.post('/create-label', async (req, res) => {
         weight_uom:        'LBS',
         dimension_uom:     'IN',
         require_signature: false,
-        // custom_field prints two extra lines in the bottom section of the label
-        // label_text1 = StoreOrderNumber (Logiwa Label Messages 2)
-        // label_text2 = StoreOrderNumber hardcoded for now — swap in Logiwa when ready
+        // LBL-Ref1 = Logiwa Label Messages 1 value
+        // LBL-Ref2 = Logiwa Label Messages 2 value
+        // Change what prints by updating Label Settings in Logiwa — no code change needed
         custom_field: {
-          label_text1: ref2,
-          label_text2: ref2,
+          'LBL-Ref1': ref1,
+          'LBL-Ref2': ref2,
         },
       };
 
@@ -337,6 +333,7 @@ app.post('/create-label', async (req, res) => {
         const tno      = d.data.tno;
         const order_id = d.data.order_id;
         console.log('[CREATE-LABEL] Order created → tno=' + tno + ' order_id=' + order_id);
+        console.log('[CREATE-LABEL] LBL-Ref1=' + ref1 + ' LBL-Ref2=' + ref2);
 
         const labelReq = { packageId: tno, labelType: 6, labelFormat: 'pdf', type: 'pdf' };
         logRequest('CREATE-LABEL:PRINT', 'POST', UNIUNI_BASE_URL + '/orders/printlabel', labelReq);
@@ -353,7 +350,7 @@ app.post('/create-label', async (req, res) => {
         console.log('[CREATE-LABEL] Label cached → key=' + tno);
 
         const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + tno;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' ref=' + ref1 + ' store#=' + ref2 + ' labelUrl=' + proxyLabelUrl);
+        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' labelUrl=' + proxyLabelUrl);
 
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -438,8 +435,9 @@ app.post('/void-label', async (req, res) => {
         continue;
       }
 
+      // FIX: correct UniUni cancel endpoint is /orders/cancelorder
       const cancelReq = { tno: trk };
-      logRequest('VOID-LABEL', 'POST', UNIUNI_BASE_URL + '/orders/cancelbytrackingnumber', cancelReq);
+      logRequest('VOID-LABEL', 'POST', UNIUNI_BASE_URL + '/orders/cancelorder', cancelReq);
 
       try {
         const cancelRes = await axios.post(
@@ -510,7 +508,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.5 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.6 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
