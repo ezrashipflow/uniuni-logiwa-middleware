@@ -1,9 +1,9 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.6
- * Changes from v1.0.5:
- *   - custom_field keys renamed to LBL-Ref1 and LBL-Ref2 (clean, neutral names)
- *   - reference field set to blank (doesn't print on label reliably)
- *   - void endpoint corrected to /orders/cancelorder
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.7
+ * Changes from v1.0.6:
+ *   - create-label now does a rate lookup first to get actual postage cost
+ *   - rateDetail.totalCost and shippingCost now populated in Logiwa UI
+ *   - Falls back to 0 gracefully if rate lookup fails
  */
 const express = require('express');
 const axios   = require('axios');
@@ -139,12 +139,52 @@ const DEFAULT_FROM = {
   name: 'ShipFlow', phone: '9085253857', email: 'info@shipflow.co',
 };
 
+// ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
+// Called inside create-label to get actual postage cost for Logiwa UI
+
+async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
+  const l = parseFloat(dims.Length || dims.length || 0);
+  const w = parseFloat(dims.Width  || dims.width  || 0);
+  const h = parseFloat(dims.Height || dims.height || 0);
+
+  const rateReq = {
+    customer_no:       parseInt(UNIUNI_CUSTOMER_NO, 10),
+    pickup_warehouse:  parseInt(UNIUNI_WAREHOUSE_ID, 10),
+    start_postal_code: shipFromPostal || DEFAULT_FROM.postalCode,
+    postal_code:       shipToPostal,
+    weight:            weightLB,
+    weight_uom:        'LBS',
+    length:            l || 13,
+    width:             w || 10,
+    height:            h || 2,
+    dimension_uom:     'IN',
+  };
+
+  try {
+    const rateRes = await axios.post(
+      UNIUNI_BASE_URL + '/orders/estimateshipping',
+      rateReq,
+      { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } }
+    );
+    const d = rateRes.data;
+    if (d.status === 'SUCCESS' && d.data) {
+      const cost = parseFloat(d.data.totalAfterTax || d.data.shippingCharge || 0);
+      console.log('[RATE-LOOKUP] cost=$' + cost + ' zone=' + d.data.zone);
+      return cost;
+    }
+    return 0;
+  } catch (e) {
+    console.warn('[RATE-LOOKUP] Failed, defaulting to 0:', e.message);
+    return 0;
+  }
+}
+
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.6',
+  version: '1.0.7',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -278,16 +318,25 @@ app.post('/create-label', async (req, res) => {
       const w = parseFloat(dims.Width  || dims.width  || 10);
       const h = parseFloat(dims.Height || dims.height || 2);
 
+      // FIX: look up rate before creating label so Logiwa shows actual postage cost
+      const postageAmount = await getRateAmount(
+        token,
+        shipFrom.postalCode || DEFAULT_FROM.postalCode,
+        shipTo.postalCode,
+        weightLB,
+        dims
+      );
+      const rateCurrency = order.currency || 'USD';
+      console.log('[CREATE-LABEL] Postage cost: $' + postageAmount);
+
       // ─── Label reference mapping ───────────────────────────────────────────
-      // ref1 = Logiwa Label Messages 1 (e.g. OrderCode)
-      // ref2 = Logiwa Label Messages 2 (e.g. StoreOrderNumber, ClientName, etc.)
       const ref1 = pkg.labelReferences?.reference1 || order.shipmentOrderCode || '';
       const ref2 = pkg.labelReferences?.reference2 || '';
 
       const shipReq = {
         customer_no:       parseInt(UNIUNI_CUSTOMER_NO, 10),
-        trace_no:          '',        // blank → UniUni generates real tno
-        reference:         '',        // blank → not used for label display
+        trace_no:          '',
+        reference:         '',
         pickup_address:    buildFullAddress({
           address1:   shipFrom.address1   || DEFAULT_FROM.address1,
           address2:   shipFrom.address2   || '',
@@ -308,9 +357,6 @@ app.post('/create-label', async (req, res) => {
         weight_uom:        'LBS',
         dimension_uom:     'IN',
         require_signature: false,
-        // LBL-Ref1 = Logiwa Label Messages 1 value
-        // LBL-Ref2 = Logiwa Label Messages 2 value
-        // Change what prints by updating Label Settings in Logiwa — no code change needed
         custom_field: {
           'LBL-Ref1': ref1,
           'LBL-Ref2': ref2,
@@ -333,7 +379,6 @@ app.post('/create-label', async (req, res) => {
         const tno      = d.data.tno;
         const order_id = d.data.order_id;
         console.log('[CREATE-LABEL] Order created → tno=' + tno + ' order_id=' + order_id);
-        console.log('[CREATE-LABEL] LBL-Ref1=' + ref1 + ' LBL-Ref2=' + ref2);
 
         const labelReq = { packageId: tno, labelType: 6, labelFormat: 'pdf', type: 'pdf' };
         logRequest('CREATE-LABEL:PRINT', 'POST', UNIUNI_BASE_URL + '/orders/printlabel', labelReq);
@@ -350,7 +395,7 @@ app.post('/create-label', async (req, res) => {
         console.log('[CREATE-LABEL] Label cached → key=' + tno);
 
         const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + tno;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' labelUrl=' + proxyLabelUrl);
+        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' cost=$' + postageAmount + ' labelUrl=' + proxyLabelUrl);
 
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -363,10 +408,20 @@ app.post('/create-label', async (req, res) => {
             encodedLabel:          labelBase64,
             labelURL:              proxyLabelUrl,
             trackingUrl:           null,
-            rateDetail:            { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
-            externalReference:     String(order_id),
+            rateDetail: {
+              totalCost:    postageAmount,
+              shippingCost: postageAmount,
+              otherCost:    0,
+              currency:     rateCurrency,
+            },
+            externalReference: String(order_id),
           }],
-          rateDetail:           { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
+          rateDetail: {
+            totalCost:    postageAmount,
+            shippingCost: postageAmount,
+            otherCost:    0,
+            currency:     rateCurrency,
+          },
           masterTrackingNumber: tno,
           isSuccessful: true,
           message:      [],
@@ -435,7 +490,6 @@ app.post('/void-label', async (req, res) => {
         continue;
       }
 
-      // FIX: correct UniUni cancel endpoint is /orders/cancelorder
       const cancelReq = { tno: trk };
       logRequest('VOID-LABEL', 'POST', UNIUNI_BASE_URL + '/orders/cancelorder', cancelReq);
 
@@ -508,7 +562,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.6 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.7 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
