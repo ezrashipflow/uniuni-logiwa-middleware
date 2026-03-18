@@ -443,7 +443,7 @@ app.post('/void-label', async (req, res) => {
 
       try {
         const cancelRes = await axios.post(
-          UNIUNI_BASE_URL + '/orders/cancelbytrackingnumber',
+          UNIUNI_BASE_URL + '/orders/cancelorder',
           cancelReq,
           { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } }
         );
