@@ -1,9 +1,10 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.7
- * Changes from v1.0.6:
- *   - create-label now does a rate lookup first to get actual postage cost
- *   - rateDetail.totalCost and shippingCost now populated in Logiwa UI
- *   - Falls back to 0 gracefully if rate lookup fails
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.8
+ * Changes from v1.0.7:
+ *   - Reduced logging verbosity to avoid Railway rate limit (no more full payload dumps)
+ *   - Label format now dynamic: reads from Logiwa labelSpecification (PDF or ZPL), defaults to PDF
+ *   - ZPL: labelFormat=zpl, type=base64, responseType=json
+ *   - PDF: labelFormat=pdf, type=pdf, responseType=arraybuffer
  */
 const express = require('express');
 const axios   = require('axios');
@@ -29,6 +30,7 @@ let cachedToken = null;
 let tokenExpiry = 0;
 
 // ─── LOGGING ──────────────────────────────────────────────────────────────────
+// Carrier API calls only — no full Logiwa payload dumps (causes Railway log rate limit)
 
 function logRequest(tag, method, url, body) {
   console.log('\n' + '─'.repeat(60));
@@ -133,6 +135,41 @@ function buildFullAddress(addr) {
   return parts.join(', ');
 }
 
+/**
+ * Resolve label format from Logiwa's labelSpecification.
+ * Logiwa sends labelFileType: "PDF" or "ZPL"
+ *
+ * UniUni printlabel params:
+ *   labelFormat: "pdf" | "zpl"
+ *   type:        "pdf" (raw binary stream) | "base64" (JSON wrapper, used for ZPL)
+ *   labelType:   6 = 4x6 inch
+ */
+function resolveLabelFormat(order) {
+  const raw = (
+    order.labelSpecification?.labelFileType ||
+    order.labelSpecification?.labelFormat   ||
+    'PDF'
+  ).toUpperCase();
+
+  if (raw === 'ZPL') {
+    return {
+      format:       'zpl',
+      labelType:    6,
+      type:         'base64',
+      mimeType:     'application/x-zebra',
+      responseType: 'json',
+    };
+  }
+  // Default PDF
+  return {
+    format:       'pdf',
+    labelType:    6,
+    type:         'pdf',
+    mimeType:     'application/pdf',
+    responseType: 'arraybuffer',
+  };
+}
+
 const DEFAULT_FROM = {
   address1: '625 Jersey Ave, Unit 9',
   city: 'New Brunswick', state: 'NJ', postalCode: '08901', country: 'US',
@@ -140,7 +177,6 @@ const DEFAULT_FROM = {
 };
 
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
-// Called inside create-label to get actual postage cost for Logiwa UI
 
 async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
   const l = parseFloat(dims.Length || dims.length || 0);
@@ -184,7 +220,7 @@ async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.7',
+  version: '1.0.8',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -197,21 +233,21 @@ app.get('/label/:id', (req, res) => {
     return res.status(404).json({ error: 'Label not found', id: req.params.id });
   }
   const buf = Buffer.from(cached.labelData, 'base64');
-  console.log('[LABEL-PROXY] Serving label id=' + req.params.id + ' size=' + buf.length + ' bytes');
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', 'inline; filename="' + req.params.id + '.pdf"');
+  console.log('[LABEL-PROXY] Serving label id=' + req.params.id + ' format=' + cached.format + ' size=' + buf.length + ' bytes');
+  res.setHeader('Content-Type', cached.mimeType || 'application/pdf');
+  res.setHeader('Content-Disposition', 'inline; filename="' + req.params.id + '.' + (cached.format || 'pdf') + '"');
   res.send(buf);
 });
 
 // ─── 1. GET RATE ──────────────────────────────────────────────────────────────
 
 app.post('/get-rate', async (req, res) => {
-  console.log('\n[GET-RATE] ══ Incoming Logiwa request ══');
-  console.log('[GET-RATE] Logiwa payload:\n', JSON.stringify(req.body, null, 2));
+  const orders = parseLogiwaBody(req.body);
+  console.log('\n[GET-RATE] ══ Incoming Logiwa request ══ orders=' + orders.length + ' first=' + orders[0]?.shipmentOrderCode + ' to=' + (orders[0]?.shipTo?.address?.PostalCode || orders[0]?.shipTo?.address?.postalCode || '?'));
+
   try {
-    const token  = await getUniUniToken();
-    const orders = parseLogiwaBody(req.body);
-    const out    = [];
+    const token = await getUniUniToken();
+    const out   = [];
 
     for (const order of orders) {
       const pkg      = order.requestedPackageLineItems?.[0] || {};
@@ -280,7 +316,7 @@ app.post('/get-rate', async (req, res) => {
     }
 
     const logiwaResponse = { data: [out[0]] };
-    console.log('[GET-RATE] → Response to Logiwa:\n', JSON.stringify(logiwaResponse, null, 2));
+    console.log('[GET-RATE] → Response to Logiwa: ' + (out[0]?.rateList?.length || 0) + ' rates for ' + out[0]?.shipmentOrderCode);
     return res.json(logiwaResponse);
 
   } catch (err) {
@@ -300,12 +336,12 @@ app.post('/get-rate', async (req, res) => {
 // ─── 2. CREATE LABEL ──────────────────────────────────────────────────────────
 
 app.post('/create-label', async (req, res) => {
-  console.log('\n[CREATE-LABEL] ══ Incoming Logiwa request ══');
-  console.log('[CREATE-LABEL] Logiwa payload:\n', JSON.stringify(req.body, null, 2));
+  const orders = parseLogiwaBody(req.body);
+  console.log('\n[CREATE-LABEL] ══ Incoming Logiwa request ══ orders=' + orders.length + ' first=' + orders[0]?.shipmentOrderCode + ' carrier=' + orders[0]?.carrier + ' service=' + orders[0]?.shippingOption);
+
   try {
-    const token  = await getUniUniToken();
-    const orders = parseLogiwaBody(req.body);
-    const out    = [];
+    const token = await getUniUniToken();
+    const out   = [];
 
     for (const order of orders) {
       const pkg       = order.requestedPackageLineItems?.[0] || {};
@@ -318,7 +354,11 @@ app.post('/create-label', async (req, res) => {
       const w = parseFloat(dims.Width  || dims.width  || 10);
       const h = parseFloat(dims.Height || dims.height || 2);
 
-      // FIX: look up rate before creating label so Logiwa shows actual postage cost
+      // Resolve label format from Logiwa labelSpecification — PDF or ZPL
+      const labelFmt = resolveLabelFormat(order);
+      console.log('[CREATE-LABEL] Label format resolved: ' + labelFmt.format.toUpperCase() + ' (labelType=' + labelFmt.labelType + ')');
+
+      // Rate lookup for postage cost display in Logiwa UI
       const postageAmount = await getRateAmount(
         token,
         shipFrom.postalCode || DEFAULT_FROM.postalCode,
@@ -329,7 +369,7 @@ app.post('/create-label', async (req, res) => {
       const rateCurrency = order.currency || 'USD';
       console.log('[CREATE-LABEL] Postage cost: $' + postageAmount);
 
-      // ─── Label reference mapping ───────────────────────────────────────────
+      // Label reference mapping
       const ref1 = pkg.labelReferences?.reference1 || order.shipmentOrderCode || '';
       const ref2 = pkg.labelReferences?.reference2 || '';
 
@@ -380,22 +420,51 @@ app.post('/create-label', async (req, res) => {
         const order_id = d.data.order_id;
         console.log('[CREATE-LABEL] Order created → tno=' + tno + ' order_id=' + order_id);
 
-        const labelReq = { packageId: tno, labelType: 6, labelFormat: 'pdf', type: 'pdf' };
+        // Print label — format and response type driven by Logiwa labelSpecification
+        const labelReq = {
+          packageId:   tno,
+          labelType:   labelFmt.labelType,
+          labelFormat: labelFmt.format,
+          type:        labelFmt.type,
+        };
         logRequest('CREATE-LABEL:PRINT', 'POST', UNIUNI_BASE_URL + '/orders/printlabel', labelReq);
 
         const labelRes = await axios.post(
           UNIUNI_BASE_URL + '/orders/printlabel',
           labelReq,
-          { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, responseType: 'arraybuffer' }
+          {
+            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+            responseType: labelFmt.responseType,
+          }
         );
-        console.log('[CREATE-LABEL:PRINT] Label fetched → size=' + labelRes.data.byteLength + ' bytes');
+        console.log('[CREATE-LABEL:PRINT] Label fetched → format=' + labelFmt.format + ' size=' + (labelRes.data?.byteLength || JSON.stringify(labelRes.data).length) + ' bytes');
 
-        const labelBase64 = Buffer.from(labelRes.data).toString('base64');
-        labelCache[tno] = { labelData: labelBase64, format: 'pdf', order_id };
-        console.log('[CREATE-LABEL] Label cached → key=' + tno);
+        // Extract base64 label data — PDF comes back as arraybuffer, ZPL as JSON with base64
+        let labelBase64;
+        if (labelFmt.format === 'zpl') {
+          // UniUni returns ZPL wrapped in JSON — try common response shapes
+          const zplRaw = labelRes.data?.data?.label
+            || labelRes.data?.label
+            || labelRes.data?.data
+            || '';
+          labelBase64 = typeof zplRaw === 'string'
+            ? zplRaw  // already base64
+            : Buffer.from(JSON.stringify(zplRaw)).toString('base64');
+          console.log('[CREATE-LABEL:PRINT] ZPL base64 length=' + labelBase64.length);
+        } else {
+          labelBase64 = Buffer.from(labelRes.data).toString('base64');
+        }
+
+        labelCache[tno] = {
+          labelData: labelBase64,
+          format:    labelFmt.format,
+          mimeType:  labelFmt.mimeType,
+          order_id,
+        };
+        console.log('[CREATE-LABEL] Label cached → key=' + tno + ' format=' + labelFmt.format);
 
         const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + tno;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' cost=$' + postageAmount + ' labelUrl=' + proxyLabelUrl);
+        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' cost=$' + postageAmount + ' format=' + labelFmt.format + ' labelUrl=' + proxyLabelUrl);
 
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -445,13 +514,7 @@ app.post('/create-label', async (req, res) => {
     }
 
     const logiwaResponse = { data: [out[0]] };
-    console.log('[CREATE-LABEL] → Response to Logiwa:\n', JSON.stringify({
-      ...logiwaResponse,
-      data: logiwaResponse.data?.map(d => ({
-        ...d,
-        packageResponse: d.packageResponse?.map(p => ({ ...p, encodedLabel: p.encodedLabel ? '[omitted]' : '' })),
-      })),
-    }, null, 2));
+    console.log('[CREATE-LABEL] → Response to Logiwa: tracking=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
     return res.json(logiwaResponse);
 
   } catch (err) {
@@ -476,12 +539,11 @@ app.post('/create-label', async (req, res) => {
 // ─── 3. VOID LABEL ────────────────────────────────────────────────────────────
 
 app.post('/void-label', async (req, res) => {
-  console.log('\n[VOID-LABEL] ══ Incoming Logiwa request ══');
-  console.log('[VOID-LABEL] Payload:\n', JSON.stringify(req.body, null, 2));
+  const orders = parseLogiwaBody(req.body);
+  console.log('\n[VOID-LABEL] ══ Incoming Logiwa request ══ trk=' + orders[0]?.masterTrackingNumber);
   try {
-    const token  = await getUniUniToken();
-    const orders = parseLogiwaBody(req.body);
-    const out    = [];
+    const token = await getUniUniToken();
+    const out   = [];
 
     for (const order of orders) {
       const trk = order.masterTrackingNumber;
@@ -544,9 +606,8 @@ app.post('/void-label', async (req, res) => {
 // ─── 4. END-OF-DAY REPORT ─────────────────────────────────────────────────────
 
 app.post('/end-of-day-report', async (req, res) => {
-  console.log('\n[EOD] ══ Incoming Logiwa request ══');
-  console.log('[EOD] Payload:\n', JSON.stringify(req.body, null, 2));
   const body = Array.isArray(req.body) ? req.body[0] : req.body;
+  console.log('\n[EOD] ══ Incoming Logiwa request ══ carrier=' + body?.carrier);
   const stub = {
     closeDate: new Date().toISOString().split('T')[0],
     carrier: 'UNIUNI-REG',
@@ -562,7 +623,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.7 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.8 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
