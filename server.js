@@ -248,6 +248,34 @@ app.get('/label/:id', (req, res) => {
   res.send(buf);
 });
 
+// ─── LABEL REPRINT (PDF) ──────────────────────────────────────────────────────
+// Re-fetches a 4x6 PDF straight from UniUni for an existing tracking number.
+
+app.get('/reprint/:tno', async (req, res) => {
+  const tno = req.params.tno;
+  if (!/^UUS[A-Z0-9]{10,30}$/.test(tno)) return res.status(400).json({ error: 'Invalid tracking number' });
+  console.log('[REPRINT] PDF requested for tno=' + tno);
+  try {
+    const token = await getUniUniToken();
+    const labelRes = await axios.post(
+      UNIUNI_BASE_URL + '/orders/printlabel',
+      { packageId: tno, labelType: 6, labelFormat: 'pdf', type: 'pdf' },
+      {
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        responseType: 'arraybuffer',
+      }
+    );
+    const buf = Buffer.from(labelRes.data);
+    console.log('[REPRINT] tno=' + tno + ' size=' + buf.length + ' bytes');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="' + tno + '.pdf"');
+    res.send(buf);
+  } catch (e) {
+    logError('REPRINT', e);
+    res.status(502).json({ error: 'UniUni reprint failed', message: e.message });
+  }
+});
+
 // ─── 1. GET RATE ──────────────────────────────────────────────────────────────
 
 app.post('/get-rate', async (req, res) => {
@@ -460,6 +488,12 @@ app.post('/create-label', async (req, res) => {
             ? zplRaw  // already base64
             : Buffer.from(JSON.stringify(zplRaw)).toString('base64');
           console.log('[CREATE-LABEL:PRINT] ZPL base64 length=' + labelBase64.length);
+          if (!labelBase64) {
+            const shape = labelRes.data && typeof labelRes.data === 'object'
+              ? Object.entries(labelRes.data).map(([k, v]) => k + ':' + (v && typeof v === 'object' ? '{' + Object.keys(v).join(',') + '}' : typeof v)).join(' ')
+              : typeof labelRes.data;
+            console.warn('[CREATE-LABEL:PRINT] Empty ZPL — response shape: ' + shape);
+          }
         } else {
           labelBase64 = Buffer.from(labelRes.data).toString('base64');
         }
