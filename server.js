@@ -1,6 +1,15 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.8
- * Changes from v1.0.7:
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.9
+ * Changes from v1.0.8:
+ *   - Carrier code is now 'Uni Uni' (was 'UNIUNI-REG') to match the Logiwa
+ *     custom carrier code. Logiwa sends carrier:null on /get-rate, so this
+ *     fallback is what it matches the returned rate against — once the Logiwa
+ *     code was renamed to 'Uni Uni', every quote was discarded and UniUni
+ *     stopped winning rate shops (last label 2026-09-22 20:51).
+ *     'Uni Uni' is also Shopify's recognized tracking company string, so the
+ *     carrier now flows through to Shopify with native clickable tracking.
+ *
+ * Changes in v1.0.8:
  *   - Reduced logging verbosity to avoid Railway rate limit (no more full payload dumps)
  *   - Label format now dynamic: reads from Logiwa labelSpecification (PDF or ZPL), defaults to PDF
  *   - ZPL: labelFormat=zpl, type=base64, responseType=json
@@ -220,7 +229,7 @@ async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.8',
+  version: '1.0.9',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -288,7 +297,7 @@ app.post('/get-rate', async (req, res) => {
           const cost = parseFloat(d.data.totalAfterTax || d.data.shippingCharge || 0);
           const eta  = parseInt(d.data.eta, 10) || null;
           rateList = [{
-            carrier:        order.carrier || 'UNIUNI-REG',
+            carrier:        order.carrier || 'Uni Uni',
             shippingOption: 'STANDARD',
             totalCost:      cost,
             shippingCost:   cost,
@@ -469,7 +478,7 @@ app.post('/create-label', async (req, res) => {
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
-          carrier:        order.carrier || 'UNIUNI-REG',
+          carrier:        order.carrier || 'Uni Uni',
           shippingOption: order.shippingOption || 'STANDARD',
           packageResponse: [{
             packageSequenceNumber: pkg.packageSequenceNumber || 0,
@@ -502,7 +511,7 @@ app.post('/create-label', async (req, res) => {
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
-          carrier:        order.carrier || 'UNIUNI-REG',
+          carrier:        order.carrier || 'Uni Uni',
           shippingOption: order.shippingOption || 'STANDARD',
           packageResponse:      [],
           rateDetail:           { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
@@ -524,7 +533,7 @@ app.post('/create-label', async (req, res) => {
       data: [{
         shipmentOrderIdentifier: o.shipmentOrderIdentifier,
         shipmentOrderCode:       o.shipmentOrderCode,
-        carrier:        o.carrier || 'UNIUNI-REG',
+        carrier:        o.carrier || 'Uni Uni',
         shippingOption: o.shippingOption || 'STANDARD',
         packageResponse:      [],
         rateDetail:           { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
@@ -610,12 +619,12 @@ app.post('/end-of-day-report', async (req, res) => {
   console.log('\n[EOD] ══ Incoming Logiwa request ══ carrier=' + body?.carrier);
   const stub = {
     closeDate: new Date().toISOString().split('T')[0],
-    carrier: 'UNIUNI-REG',
+    carrier: 'Uni Uni',
     message: 'UniUni does not require end-of-day manifests',
   };
   return res.json({
     carrierSetupIdentifier: body.carrierSetupIdentifier,
-    carrier:       body.carrier || 'UNIUNI-REG',
+    carrier:       body.carrier || 'Uni Uni',
     encodedReport: Buffer.from(JSON.stringify(stub)).toString('base64'),
     isSuccessful:  true,
     message:       '',
@@ -623,7 +632,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.8 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.9 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
