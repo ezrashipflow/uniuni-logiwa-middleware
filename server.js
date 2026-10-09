@@ -1,6 +1,14 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.9
- * Changes from v1.0.8:
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.1.0
+ * Changes from v1.0.9:
+ *   - Hazmat rules from UniUni's Hazardous Materials Shipping Guide: a hazmat
+ *     order gets no rate and no label when it is going outside the contiguous
+ *     U.S., weighs over 30 lb, or holds a class / UN number UniUni prohibits.
+ *     Other hazmat orders rate and label as before.
+ *   - A hazmat label is followed by a second label, in the same PDF / ZPL,
+ *     carrying the Limited Quantity mark for the carton.
+ *
+ * Changes in v1.0.9:
  *   - Carrier code is now 'Uni Uni' (was 'UNIUNI-REG') to match the Logiwa
  *     custom carrier code. Logiwa sends carrier:null on /get-rate, so this
  *     fallback is what it matches the returned rate against — once the Logiwa
@@ -185,6 +193,166 @@ const DEFAULT_FROM = {
   name: 'ShipFlow', phone: '9085253857', email: 'info@shipflow.co',
 };
 
+// ─── HAZMAT ───────────────────────────────────────────────────────────────────
+// Logiwa flags hazmat per product (isHazardous + hazmat* fields) on each box's
+// products[] and on internationalOptions.customsItems.
+//
+// UniUni carries a limited list of hazmat by ground (UniUni Hazardous Materials
+// Shipping Guide). Its API has no hazmat field: the declaration is the marks on
+// the carton plus the signed "UniUni Hazardous Materials Shipping Certification"
+// attached to it — warehouse work, not something this service can send. What we
+// can do here is refuse the orders the guide rules out, so they get no rate
+// (and drop out of Logiwa's rate shop) and no label:
+//   - §2.3  contiguous U.S. only — not Alaska, Hawaii, territories or abroad
+//   - §3.1.4 package over 30 lb
+//   - §2.1  prohibited classes and UN numbers (when Logiwa has them)
+// A hazmat product with no class / UN number in Logiwa is let through: the
+// guide puts classification on the shipper, and we cannot tell from here.
+
+const HAZMAT_MAX_LB = 30;
+const NON_CONTIGUOUS = ['AK', 'HI', 'PR', 'GU', 'VI', 'AS', 'MP', 'AA', 'AE', 'AP'];
+// §2.1 + Appendix A: standalone lithium (3480 / 3090), lighters, fireworks,
+// gasoline, matches, mercury, compressed gas.
+const PROHIBITED_UN = ['3480', '3090', '1057', '0336', '0337', '1203', '1944', '1331', '2809', '1956'];
+
+function isHazmatLine(p) {
+  return !!p && (p.isHazardous === true || String(p.isHazardous).toLowerCase() === 'true'
+    || !!p.hazmatIdentificationNumber || !!p.hazmatClassDivisionNumber);
+}
+
+function orderProducts(order) {
+  const boxes = Array.isArray(order.requestedPackageLineItems) ? order.requestedPackageLineItems : [];
+  const customs = order.internationalOptions?.customsItems;
+  return boxes.flatMap(b => Array.isArray(b.products) ? b.products : [])
+    .concat(Array.isArray(customs) ? customs : []);
+}
+
+// SKUs of the hazmat items on the order; empty when there are none.
+function hazmatSkus(order) {
+  return [...new Set(orderProducts(order).filter(isHazmatLine).map(p => p.sku || p.description || 'unknown SKU'))];
+}
+
+// §2.1: classes UniUni never carries. 2.2, 3, 5.1, 8 and 9 are restricted
+// carriage (allowed on conditions). 2.1 is treated as prohibited: the guide
+// lists flammable gases as prohibited and aerosols only under 2.2.
+function prohibitedClass(raw) {
+  const m = String(raw || '').match(/(\d)(?:\.(\d))?/);
+  if (!m) return null;
+  const cls = m[1], div = m[2];
+  if (['1', '4', '6', '7'].includes(cls)) return 'Class ' + cls;
+  if (cls === '2' && div !== '2') return 'Class 2' + (div ? '.' + div : '') + ' gas';
+  if (cls === '5' && div === '2') return 'Class 5.2';
+  return null;
+}
+
+// Why UniUni cannot take this order's hazmat, or null when it can (or there is none).
+function hazmatRefusal(order) {
+  const lines = orderProducts(order).filter(isHazmatLine);
+  if (!lines.length) return null;
+  const label = 'Hazmat item on order (' + hazmatSkus(order).join(', ') + ') — UniUni ';
+
+  const to = getAddr(order.shipTo);
+  const state = String(to.state || '').toUpperCase();
+  if (String(to.country || 'US').toUpperCase() !== 'US' || NON_CONTIGUOUS.includes(state)) {
+    return label + 'carries hazmat within the contiguous U.S. only, not to ' + (state || to.country);
+  }
+
+  for (const box of (order.requestedPackageLineItems || [])) {
+    const lb = weightToLB(box.weight?.Value || box.weight?.value, box.weight?.Units || box.weight?.units);
+    if (lb > HAZMAT_MAX_LB) return label + 'takes hazmat packages up to ' + HAZMAT_MAX_LB + ' lb, this one is ' + lb + ' lb';
+  }
+
+  for (const p of lines) {
+    const un = String(p.hazmatIdentificationNumber || '').replace(/\D/g, '').padStart(4, '0');
+    if (p.hazmatIdentificationNumber && PROHIBITED_UN.includes(un)) return label + 'does not carry UN' + un + ' (' + (p.sku || 'item') + ')';
+    const cls = prohibitedClass(p.hazmatClassDivisionNumber);
+    if (cls) return label + 'does not carry ' + cls + ' (' + (p.sku || 'item') + ')';
+  }
+  return null;
+}
+
+// ─── LIMITED QUANTITY MARK ────────────────────────────────────────────────────
+// A hazmat carton going UniUni must carry the Limited Quantity mark (49 CFR
+// §172.315; UniUni guide §4.2.1): a square on point, top and bottom corners
+// black, centre white. We print it as a second label straight after the
+// shipping label, in the same file, so the packer gets both from one print.
+//
+// Size: the rule is 100 mm per side, or no less than 50 mm where the package
+// is too small for that. A 4x6 label is 101.6 mm wide, so the largest mark it
+// can hold is about 63 mm per side — the reduced size, right for small parcels.
+//
+// Lithium batteries (UN3481 / UN3091) take the lithium battery mark instead,
+// which needs a UN number and phone number; we do not print that one.
+
+const LITHIUM_UN = ['3481', '3091'];
+
+function needsLimitedQuantityMark(order) {
+  return orderProducts(order).filter(isHazmatLine).some(p =>
+    !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+}
+
+// The mark as plain geometry, in whatever unit the caller draws in.
+//   r = half the diagonal, t = border thickness, a = half-height of the white band
+function lqGeometry(width, height, margin, t) {
+  const r  = Math.min(width, height) / 2 - margin;
+  const cx = width / 2, cy = height / 2;
+  const a  = r * 0.5;
+  const ri = r - t * Math.SQRT2;          // inner (white) diamond, inset by the border
+  return { r, cx, cy, a, ri, t };
+}
+
+async function lqMarkPdf(pdfBase64, caption) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc   = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const first = doc.getPage(0).getSize();
+  const page  = doc.addPage([first.width, first.height]);
+  const { width: W, height: H } = first;
+  const mm = 72 / 25.4;
+  const g  = lqGeometry(W, H, 6 * mm, 2 * mm);
+  const P  = (pts) => 'M ' + pts.map(([x, y]) => x.toFixed(2) + ' ' + y.toFixed(2)).join(' L ') + ' Z';
+  // SVG path space: origin top-left of the page, y down.
+  const at = { x: 0, y: H };
+  page.drawSvgPath(P([[g.cx, g.cy - g.r], [g.cx + g.r, g.cy], [g.cx, g.cy + g.r], [g.cx - g.r, g.cy]]), { ...at, color: rgb(0, 0, 0) });
+  const w = g.ri - g.a;                    // half-width of the white band at its top and bottom
+  page.drawSvgPath(P([[g.cx - w, g.cy - g.a], [g.cx + w, g.cy - g.a], [g.cx + g.ri, g.cy], [g.cx + w, g.cy + g.a], [g.cx - w, g.cy + g.a], [g.cx - g.ri, g.cy]]), { ...at, color: rgb(1, 1, 1) });
+  const font = await doc.embedFont(StandardFonts.HelveticaBold);
+  const size = 14;
+  page.drawText(caption, { x: (W - font.widthOfTextAtSize(caption, size)) / 2, y: 7 * mm, size, font, color: rgb(0, 0, 0) });
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+function lqMarkZpl(zplBase64, caption) {
+  const zpl = Buffer.from(zplBase64, 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  // Match the printer resolution of UniUni's own label: ^PW is its width in dots.
+  const pw  = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const dpm = pw / 101.6;                  // dots per mm on a 4-inch-wide label
+  const W = pw, H = Math.round(pw * 1.5);
+  const g = lqGeometry(W, H, 6 * dpm, 2 * dpm);
+  const step = 3;                          // strip height in dots
+  const bar  = Math.round(g.t * Math.SQRT2);
+  const out  = ['^XA', '^PW' + W, '^LL' + H, '^LH0,0'];
+  const box  = (x, y, w) => out.push('^FO' + Math.round(x) + ',' + Math.round(y) + '^GB' + Math.max(Math.round(w), 1) + ',' + step + ',' + step + '^FS');
+  for (let y = g.cy - g.r; y < g.cy + g.r; y += step) {
+    const hw = g.r - Math.abs(y + step / 2 - g.cy);   // half-width of the diamond on this row
+    if (hw <= 0) continue;
+    if (Math.abs(y + step / 2 - g.cy) >= g.a || hw * 2 <= bar * 2) {
+      box(g.cx - hw, y, hw * 2);                       // black corner: full width
+    } else {
+      box(g.cx - hw, y, bar);                          // white band: just the two borders
+      box(g.cx + hw - bar, y, bar);
+    }
+  }
+  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
+  return Buffer.from(zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n').toString('base64');
+}
+
+// Shipping label + Limited Quantity mark, same format as the label came in.
+function withLimitedQuantityMark(labelBase64, format, order) {
+  const caption = 'LIMITED QUANTITY - ' + (order.shipmentOrderCode || '');
+  return format === 'zpl' ? lqMarkZpl(labelBase64, caption) : lqMarkPdf(labelBase64, caption);
+}
+
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
 
 async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
@@ -229,7 +397,7 @@ async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.9',
+  version: '1.1.0',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -287,6 +455,21 @@ app.post('/get-rate', async (req, res) => {
     const out   = [];
 
     for (const order of orders) {
+      const hazmat = hazmatSkus(order);
+      console.log('[GET-RATE] ' + order.shipmentOrderCode + ' products=' + orderProducts(order).length + ' hazmat=' + (hazmat.length ? hazmat.join(',') : 'no'));
+      const refusal = hazmatRefusal(order);
+      if (refusal) {
+        console.log('[GET-RATE] BLOCKED ' + order.shipmentOrderCode + ' — ' + refusal);
+        out.push({
+          shipmentOrderCode:       order.shipmentOrderCode,
+          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+          rateList:     [],
+          isSuccessful: false,
+          message:      [refusal],
+        });
+        continue;
+      }
+
       const pkg      = order.requestedPackageLineItems?.[0] || {};
       const shipTo   = getAddr(order.shipTo);
       const shipFrom = getAddr(order.shipFrom);
@@ -381,6 +564,26 @@ app.post('/create-label', async (req, res) => {
     const out   = [];
 
     for (const order of orders) {
+      // Never buy a label for hazmat UniUni does not carry, even if Logiwa was pointed here by hand.
+      const hazmat = hazmatSkus(order);
+      const refusal = hazmatRefusal(order);
+      if (hazmat.length && !refusal) console.log('[CREATE-LABEL] ' + order.shipmentOrderCode + ' hazmat=' + hazmat.join(',') + ' — accepted');
+      if (refusal) {
+        console.log('[CREATE-LABEL] BLOCKED ' + order.shipmentOrderCode + ' — ' + refusal);
+        out.push({
+          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+          shipmentOrderCode:       order.shipmentOrderCode,
+          carrier:        order.carrier || 'Uni Uni',
+          shippingOption: order.shippingOption || 'STANDARD',
+          packageResponse:      [],
+          rateDetail:           { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
+          masterTrackingNumber: '',
+          isSuccessful: false,
+          message:      [refusal],
+        });
+        continue;
+      }
+
       const pkg       = order.requestedPackageLineItems?.[0] || {};
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
@@ -496,6 +699,17 @@ app.post('/create-label', async (req, res) => {
           }
         } else {
           labelBase64 = Buffer.from(labelRes.data).toString('base64');
+        }
+
+        // Hazmat: print the Limited Quantity mark as a second label after this one.
+        // The shipping label is already bought, so a failure here must not lose it.
+        if (labelBase64 && needsLimitedQuantityMark(order)) {
+          try {
+            labelBase64 = await withLimitedQuantityMark(labelBase64, labelFmt.format, order);
+            console.log('[CREATE-LABEL] Limited Quantity mark added after the shipping label (' + labelFmt.format + ')');
+          } catch (e) {
+            console.warn('[CREATE-LABEL] ⚠ could not add the Limited Quantity mark — apply one by hand: ' + e.message);
+          }
         }
 
         labelCache[tno] = {
@@ -666,7 +880,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.9 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.1.0 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
