@@ -316,7 +316,7 @@ async function lqMarkPdf(pdfBase64, caption) {
   const w = g.ri - g.a;                    // half-width of the white band at its top and bottom
   page.drawSvgPath(P([[g.cx - w, g.cy - g.a], [g.cx + w, g.cy - g.a], [g.cx + g.ri, g.cy], [g.cx + w, g.cy + g.a], [g.cx - w, g.cy + g.a], [g.cx - g.ri, g.cy]]), { ...at, color: rgb(1, 1, 1) });
   const font = await doc.embedFont(StandardFonts.HelveticaBold);
-  const size = 10;
+  const size = 14;
   page.drawText(caption, { x: (W - font.widthOfTextAtSize(caption, size)) / 2, y: 7 * mm, size, font, color: rgb(0, 0, 0) });
   return Buffer.from(await doc.save()).toString('base64');
 }
@@ -343,13 +343,13 @@ function lqMarkZpl(zplBase64, caption) {
       box(g.cx + hw - bar, y, bar);
     }
   }
-  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(3.8 * dpm) + ',' + Math.round(3.8 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
+  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
   return Buffer.from(zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n').toString('base64');
 }
 
 // Shipping label + Limited Quantity mark, same format as the label came in.
 function withLimitedQuantityMark(labelBase64, format, order) {
-  const caption = 'LIMITED QUANTITY - APPLY TO CARTON - ' + (order.shipmentOrderCode || '');
+  const caption = 'LIMITED QUANTITY - ' + (order.shipmentOrderCode || '');
   return format === 'zpl' ? lqMarkZpl(labelBase64, caption) : lqMarkPdf(labelBase64, caption);
 }
 
