@@ -5,6 +5,8 @@
  *     order gets no rate and no label when it is going outside the contiguous
  *     U.S., weighs over 30 lb, or holds a class / UN number UniUni prohibits.
  *     Other hazmat orders rate and label as before.
+ *   - A hazmat label is followed by a second label, in the same PDF / ZPL,
+ *     carrying the Limited Quantity mark for the carton.
  *
  * Changes in v1.0.9:
  *   - Carrier code is now 'Uni Uni' (was 'UNIUNI-REG') to match the Logiwa
@@ -269,6 +271,88 @@ function hazmatRefusal(order) {
   return null;
 }
 
+// ─── LIMITED QUANTITY MARK ────────────────────────────────────────────────────
+// A hazmat carton going UniUni must carry the Limited Quantity mark (49 CFR
+// §172.315; UniUni guide §4.2.1): a square on point, top and bottom corners
+// black, centre white. We print it as a second label straight after the
+// shipping label, in the same file, so the packer gets both from one print.
+//
+// Size: the rule is 100 mm per side, or no less than 50 mm where the package
+// is too small for that. A 4x6 label is 101.6 mm wide, so the largest mark it
+// can hold is about 63 mm per side — the reduced size, right for small parcels.
+//
+// Lithium batteries (UN3481 / UN3091) take the lithium battery mark instead,
+// which needs a UN number and phone number; we do not print that one.
+
+const LITHIUM_UN = ['3481', '3091'];
+
+function needsLimitedQuantityMark(order) {
+  return orderProducts(order).filter(isHazmatLine).some(p =>
+    !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+}
+
+// The mark as plain geometry, in whatever unit the caller draws in.
+//   r = half the diagonal, t = border thickness, a = half-height of the white band
+function lqGeometry(width, height, margin, t) {
+  const r  = Math.min(width, height) / 2 - margin;
+  const cx = width / 2, cy = height / 2;
+  const a  = r * 0.5;
+  const ri = r - t * Math.SQRT2;          // inner (white) diamond, inset by the border
+  return { r, cx, cy, a, ri, t };
+}
+
+async function lqMarkPdf(pdfBase64, caption) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc   = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const first = doc.getPage(0).getSize();
+  const page  = doc.addPage([first.width, first.height]);
+  const { width: W, height: H } = first;
+  const mm = 72 / 25.4;
+  const g  = lqGeometry(W, H, 6 * mm, 2 * mm);
+  const P  = (pts) => 'M ' + pts.map(([x, y]) => x.toFixed(2) + ' ' + y.toFixed(2)).join(' L ') + ' Z';
+  // SVG path space: origin top-left of the page, y down.
+  const at = { x: 0, y: H };
+  page.drawSvgPath(P([[g.cx, g.cy - g.r], [g.cx + g.r, g.cy], [g.cx, g.cy + g.r], [g.cx - g.r, g.cy]]), { ...at, color: rgb(0, 0, 0) });
+  const w = g.ri - g.a;                    // half-width of the white band at its top and bottom
+  page.drawSvgPath(P([[g.cx - w, g.cy - g.a], [g.cx + w, g.cy - g.a], [g.cx + g.ri, g.cy], [g.cx + w, g.cy + g.a], [g.cx - w, g.cy + g.a], [g.cx - g.ri, g.cy]]), { ...at, color: rgb(1, 1, 1) });
+  const font = await doc.embedFont(StandardFonts.HelveticaBold);
+  const size = 10;
+  page.drawText(caption, { x: (W - font.widthOfTextAtSize(caption, size)) / 2, y: 7 * mm, size, font, color: rgb(0, 0, 0) });
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+function lqMarkZpl(zplBase64, caption) {
+  const zpl = Buffer.from(zplBase64, 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  // Match the printer resolution of UniUni's own label: ^PW is its width in dots.
+  const pw  = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const dpm = pw / 101.6;                  // dots per mm on a 4-inch-wide label
+  const W = pw, H = Math.round(pw * 1.5);
+  const g = lqGeometry(W, H, 6 * dpm, 2 * dpm);
+  const step = 3;                          // strip height in dots
+  const bar  = Math.round(g.t * Math.SQRT2);
+  const out  = ['^XA', '^PW' + W, '^LL' + H, '^LH0,0'];
+  const box  = (x, y, w) => out.push('^FO' + Math.round(x) + ',' + Math.round(y) + '^GB' + Math.max(Math.round(w), 1) + ',' + step + ',' + step + '^FS');
+  for (let y = g.cy - g.r; y < g.cy + g.r; y += step) {
+    const hw = g.r - Math.abs(y + step / 2 - g.cy);   // half-width of the diamond on this row
+    if (hw <= 0) continue;
+    if (Math.abs(y + step / 2 - g.cy) >= g.a || hw * 2 <= bar * 2) {
+      box(g.cx - hw, y, hw * 2);                       // black corner: full width
+    } else {
+      box(g.cx - hw, y, bar);                          // white band: just the two borders
+      box(g.cx + hw - bar, y, bar);
+    }
+  }
+  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(3.8 * dpm) + ',' + Math.round(3.8 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
+  return Buffer.from(zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n').toString('base64');
+}
+
+// Shipping label + Limited Quantity mark, same format as the label came in.
+function withLimitedQuantityMark(labelBase64, format, order) {
+  const caption = 'LIMITED QUANTITY - APPLY TO CARTON - ' + (order.shipmentOrderCode || '');
+  return format === 'zpl' ? lqMarkZpl(labelBase64, caption) : lqMarkPdf(labelBase64, caption);
+}
+
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
 
 async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
@@ -483,7 +567,7 @@ app.post('/create-label', async (req, res) => {
       // Never buy a label for hazmat UniUni does not carry, even if Logiwa was pointed here by hand.
       const hazmat = hazmatSkus(order);
       const refusal = hazmatRefusal(order);
-      if (hazmat.length && !refusal) console.log('[CREATE-LABEL] ' + order.shipmentOrderCode + ' hazmat=' + hazmat.join(',') + ' — accepted; carton needs hazmat marks + UniUni shipping certification');
+      if (hazmat.length && !refusal) console.log('[CREATE-LABEL] ' + order.shipmentOrderCode + ' hazmat=' + hazmat.join(',') + ' — accepted');
       if (refusal) {
         console.log('[CREATE-LABEL] BLOCKED ' + order.shipmentOrderCode + ' — ' + refusal);
         out.push({
@@ -615,6 +699,17 @@ app.post('/create-label', async (req, res) => {
           }
         } else {
           labelBase64 = Buffer.from(labelRes.data).toString('base64');
+        }
+
+        // Hazmat: print the Limited Quantity mark as a second label after this one.
+        // The shipping label is already bought, so a failure here must not lose it.
+        if (labelBase64 && needsLimitedQuantityMark(order)) {
+          try {
+            labelBase64 = await withLimitedQuantityMark(labelBase64, labelFmt.format, order);
+            console.log('[CREATE-LABEL] Limited Quantity mark added after the shipping label (' + labelFmt.format + ')');
+          } catch (e) {
+            console.warn('[CREATE-LABEL] ⚠ could not add the Limited Quantity mark — apply one by hand: ' + e.message);
+          }
         }
 
         labelCache[tno] = {
