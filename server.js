@@ -1,6 +1,10 @@
 /**
- * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.0.9
- * Changes from v1.0.8:
+ * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.1.0
+ * Changes from v1.0.9:
+ *   - Hazmat block: an order with any product Logiwa flags as hazardous gets
+ *     no rate and no label. UniUni does not carry hazardous materials.
+ *
+ * Changes in v1.0.9:
  *   - Carrier code is now 'Uni Uni' (was 'UNIUNI-REG') to match the Logiwa
  *     custom carrier code. Logiwa sends carrier:null on /get-rate, so this
  *     fallback is what it matches the returned rate against — once the Logiwa
@@ -185,6 +189,33 @@ const DEFAULT_FROM = {
   name: 'ShipFlow', phone: '9085253857', email: 'info@shipflow.co',
 };
 
+// ─── HAZMAT ───────────────────────────────────────────────────────────────────
+// Logiwa flags hazmat per product (isHazardous + hazmat* fields) on each box's
+// products[] and on internationalOptions.customsItems. UniUni does not carry
+// hazardous materials and its API has nowhere to declare them, so a hazmat
+// order gets no rate (it drops out of Logiwa's rate shop) and no label.
+
+function isHazmatLine(p) {
+  return !!p && (p.isHazardous === true || String(p.isHazardous).toLowerCase() === 'true'
+    || !!p.hazmatIdentificationNumber || !!p.hazmatClassDivisionNumber);
+}
+
+function orderProducts(order) {
+  const boxes = Array.isArray(order.requestedPackageLineItems) ? order.requestedPackageLineItems : [];
+  const customs = order.internationalOptions?.customsItems;
+  return boxes.flatMap(b => Array.isArray(b.products) ? b.products : [])
+    .concat(Array.isArray(customs) ? customs : []);
+}
+
+// SKUs of the hazmat items on the order; empty when there are none.
+function hazmatSkus(order) {
+  return [...new Set(orderProducts(order).filter(isHazmatLine).map(p => p.sku || p.description || 'unknown SKU'))];
+}
+
+function hazmatMessage(skus) {
+  return 'Hazmat item on order (' + skus.join(', ') + ') — UniUni does not accept hazardous materials';
+}
+
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
 
 async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
@@ -229,7 +260,7 @@ async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims
 app.get('/', (req, res) => res.json({
   status: 'running',
   service: 'UniUni <-> Logiwa Middleware',
-  version: '1.0.9',
+  version: '1.1.0',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
 }));
 
@@ -287,6 +318,20 @@ app.post('/get-rate', async (req, res) => {
     const out   = [];
 
     for (const order of orders) {
+      const hazmat = hazmatSkus(order);
+      console.log('[GET-RATE] ' + order.shipmentOrderCode + ' products=' + orderProducts(order).length + ' hazmat=' + (hazmat.length ? hazmat.join(',') : 'no'));
+      if (hazmat.length) {
+        console.log('[GET-RATE] BLOCKED ' + order.shipmentOrderCode + ' — ' + hazmatMessage(hazmat));
+        out.push({
+          shipmentOrderCode:       order.shipmentOrderCode,
+          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+          rateList:     [],
+          isSuccessful: false,
+          message:      [hazmatMessage(hazmat)],
+        });
+        continue;
+      }
+
       const pkg      = order.requestedPackageLineItems?.[0] || {};
       const shipTo   = getAddr(order.shipTo);
       const shipFrom = getAddr(order.shipFrom);
@@ -381,6 +426,24 @@ app.post('/create-label', async (req, res) => {
     const out   = [];
 
     for (const order of orders) {
+      // Never buy a label for a hazmat order, even if Logiwa was pointed here by hand.
+      const hazmat = hazmatSkus(order);
+      if (hazmat.length) {
+        console.log('[CREATE-LABEL] BLOCKED ' + order.shipmentOrderCode + ' — ' + hazmatMessage(hazmat));
+        out.push({
+          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+          shipmentOrderCode:       order.shipmentOrderCode,
+          carrier:        order.carrier || 'Uni Uni',
+          shippingOption: order.shippingOption || 'STANDARD',
+          packageResponse:      [],
+          rateDetail:           { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
+          masterTrackingNumber: '',
+          isSuccessful: false,
+          message:      [hazmatMessage(hazmat)],
+        });
+        continue;
+      }
+
       const pkg       = order.requestedPackageLineItems?.[0] || {};
       const shipTo    = getAddr(order.shipTo);
       const toContact = getContact(order.shipTo);
@@ -666,7 +729,7 @@ app.post('/end-of-day-report', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('\n🚀 UniUni-Logiwa Middleware v1.0.9 on port ' + PORT);
+  console.log('\n🚀 UniUni-Logiwa Middleware v1.1.0 on port ' + PORT);
   console.log('   Label proxy  : ' + MIDDLEWARE_URL + '/label/:id');
   console.log('   Customer No  : ' + UNIUNI_CUSTOMER_NO);
   console.log('   Warehouse ID : ' + (UNIUNI_WAREHOUSE_ID || 'NOT SET'));
