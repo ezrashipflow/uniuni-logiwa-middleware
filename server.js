@@ -1,8 +1,10 @@
 /**
  * UniUni eCommerce <-> Logiwa Custom Carrier Middleware v1.1.0
  * Changes from v1.0.9:
- *   - Hazmat block: an order with any product Logiwa flags as hazardous gets
- *     no rate and no label. UniUni does not carry hazardous materials.
+ *   - Hazmat rules from UniUni's Hazardous Materials Shipping Guide: a hazmat
+ *     order gets no rate and no label when it is going outside the contiguous
+ *     U.S., weighs over 30 lb, or holds a class / UN number UniUni prohibits.
+ *     Other hazmat orders rate and label as before.
  *
  * Changes in v1.0.9:
  *   - Carrier code is now 'Uni Uni' (was 'UNIUNI-REG') to match the Logiwa
@@ -191,9 +193,25 @@ const DEFAULT_FROM = {
 
 // ─── HAZMAT ───────────────────────────────────────────────────────────────────
 // Logiwa flags hazmat per product (isHazardous + hazmat* fields) on each box's
-// products[] and on internationalOptions.customsItems. UniUni does not carry
-// hazardous materials and its API has nowhere to declare them, so a hazmat
-// order gets no rate (it drops out of Logiwa's rate shop) and no label.
+// products[] and on internationalOptions.customsItems.
+//
+// UniUni carries a limited list of hazmat by ground (UniUni Hazardous Materials
+// Shipping Guide). Its API has no hazmat field: the declaration is the marks on
+// the carton plus the signed "UniUni Hazardous Materials Shipping Certification"
+// attached to it — warehouse work, not something this service can send. What we
+// can do here is refuse the orders the guide rules out, so they get no rate
+// (and drop out of Logiwa's rate shop) and no label:
+//   - §2.3  contiguous U.S. only — not Alaska, Hawaii, territories or abroad
+//   - §3.1.4 package over 30 lb
+//   - §2.1  prohibited classes and UN numbers (when Logiwa has them)
+// A hazmat product with no class / UN number in Logiwa is let through: the
+// guide puts classification on the shipper, and we cannot tell from here.
+
+const HAZMAT_MAX_LB = 30;
+const NON_CONTIGUOUS = ['AK', 'HI', 'PR', 'GU', 'VI', 'AS', 'MP', 'AA', 'AE', 'AP'];
+// §2.1 + Appendix A: standalone lithium (3480 / 3090), lighters, fireworks,
+// gasoline, matches, mercury, compressed gas.
+const PROHIBITED_UN = ['3480', '3090', '1057', '0336', '0337', '1203', '1944', '1331', '2809', '1956'];
 
 function isHazmatLine(p) {
   return !!p && (p.isHazardous === true || String(p.isHazardous).toLowerCase() === 'true'
@@ -212,8 +230,43 @@ function hazmatSkus(order) {
   return [...new Set(orderProducts(order).filter(isHazmatLine).map(p => p.sku || p.description || 'unknown SKU'))];
 }
 
-function hazmatMessage(skus) {
-  return 'Hazmat item on order (' + skus.join(', ') + ') — UniUni does not accept hazardous materials';
+// §2.1: classes UniUni never carries. 2.2, 3, 5.1, 8 and 9 are restricted
+// carriage (allowed on conditions). 2.1 is treated as prohibited: the guide
+// lists flammable gases as prohibited and aerosols only under 2.2.
+function prohibitedClass(raw) {
+  const m = String(raw || '').match(/(\d)(?:\.(\d))?/);
+  if (!m) return null;
+  const cls = m[1], div = m[2];
+  if (['1', '4', '6', '7'].includes(cls)) return 'Class ' + cls;
+  if (cls === '2' && div !== '2') return 'Class 2' + (div ? '.' + div : '') + ' gas';
+  if (cls === '5' && div === '2') return 'Class 5.2';
+  return null;
+}
+
+// Why UniUni cannot take this order's hazmat, or null when it can (or there is none).
+function hazmatRefusal(order) {
+  const lines = orderProducts(order).filter(isHazmatLine);
+  if (!lines.length) return null;
+  const label = 'Hazmat item on order (' + hazmatSkus(order).join(', ') + ') — UniUni ';
+
+  const to = getAddr(order.shipTo);
+  const state = String(to.state || '').toUpperCase();
+  if (String(to.country || 'US').toUpperCase() !== 'US' || NON_CONTIGUOUS.includes(state)) {
+    return label + 'carries hazmat within the contiguous U.S. only, not to ' + (state || to.country);
+  }
+
+  for (const box of (order.requestedPackageLineItems || [])) {
+    const lb = weightToLB(box.weight?.Value || box.weight?.value, box.weight?.Units || box.weight?.units);
+    if (lb > HAZMAT_MAX_LB) return label + 'takes hazmat packages up to ' + HAZMAT_MAX_LB + ' lb, this one is ' + lb + ' lb';
+  }
+
+  for (const p of lines) {
+    const un = String(p.hazmatIdentificationNumber || '').replace(/\D/g, '').padStart(4, '0');
+    if (p.hazmatIdentificationNumber && PROHIBITED_UN.includes(un)) return label + 'does not carry UN' + un + ' (' + (p.sku || 'item') + ')';
+    const cls = prohibitedClass(p.hazmatClassDivisionNumber);
+    if (cls) return label + 'does not carry ' + cls + ' (' + (p.sku || 'item') + ')';
+  }
+  return null;
 }
 
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
@@ -320,14 +373,15 @@ app.post('/get-rate', async (req, res) => {
     for (const order of orders) {
       const hazmat = hazmatSkus(order);
       console.log('[GET-RATE] ' + order.shipmentOrderCode + ' products=' + orderProducts(order).length + ' hazmat=' + (hazmat.length ? hazmat.join(',') : 'no'));
-      if (hazmat.length) {
-        console.log('[GET-RATE] BLOCKED ' + order.shipmentOrderCode + ' — ' + hazmatMessage(hazmat));
+      const refusal = hazmatRefusal(order);
+      if (refusal) {
+        console.log('[GET-RATE] BLOCKED ' + order.shipmentOrderCode + ' — ' + refusal);
         out.push({
           shipmentOrderCode:       order.shipmentOrderCode,
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           rateList:     [],
           isSuccessful: false,
-          message:      [hazmatMessage(hazmat)],
+          message:      [refusal],
         });
         continue;
       }
@@ -426,10 +480,12 @@ app.post('/create-label', async (req, res) => {
     const out   = [];
 
     for (const order of orders) {
-      // Never buy a label for a hazmat order, even if Logiwa was pointed here by hand.
+      // Never buy a label for hazmat UniUni does not carry, even if Logiwa was pointed here by hand.
       const hazmat = hazmatSkus(order);
-      if (hazmat.length) {
-        console.log('[CREATE-LABEL] BLOCKED ' + order.shipmentOrderCode + ' — ' + hazmatMessage(hazmat));
+      const refusal = hazmatRefusal(order);
+      if (hazmat.length && !refusal) console.log('[CREATE-LABEL] ' + order.shipmentOrderCode + ' hazmat=' + hazmat.join(',') + ' — accepted; carton needs hazmat marks + UniUni shipping certification');
+      if (refusal) {
+        console.log('[CREATE-LABEL] BLOCKED ' + order.shipmentOrderCode + ' — ' + refusal);
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
@@ -439,7 +495,7 @@ app.post('/create-label', async (req, res) => {
           rateDetail:           { totalCost: 0, shippingCost: 0, otherCost: 0, currency: 'USD' },
           masterTrackingNumber: '',
           isSuccessful: false,
-          message:      [hazmatMessage(hazmat)],
+          message:      [refusal],
         });
         continue;
       }
