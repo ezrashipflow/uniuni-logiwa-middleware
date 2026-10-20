@@ -206,8 +206,9 @@ const DEFAULT_FROM = {
 //   - §2.3  contiguous U.S. only — not Alaska, Hawaii, territories or abroad
 //   - §3.1.4 package over 30 lb
 //   - §2.1  prohibited classes and UN numbers
-//   - an aerosol (UN1950) that isn't class 2.2 — §2.1 lists flammable gases as
-//     prohibited, so a 2.1 or unclassed aerosol stays off UniUni
+//   - an aerosol (UN1950) without class 2.1 or 2.2 set. The guide's rules list
+//     aerosols under 2.2 only, but its own sample certification (p.19) ships a
+//     2.1 aerosol as Limited Quantity, and ShipFlow ships 2.1 aerosols here.
 // We also refuse what we can't mark or don't vouch for: lithium batteries in
 // equipment (no lithium battery mark is printed here), Fully Regulated items,
 // and a hazmat product with no UN number or class in Logiwa.
@@ -236,8 +237,8 @@ function hazmatSkus(order) {
 }
 
 // §2.1: classes UniUni never carries. 2.2, 3, 5.1, 8 and 9 are restricted
-// carriage (allowed on conditions). 2.1 is treated as prohibited: the guide
-// lists flammable gases as prohibited and aerosols only under 2.2.
+// carriage (allowed on conditions). Other 2.1 gases are prohibited; a 2.1
+// aerosol (UN1950) is let through by hazmatRefusal.
 function prohibitedClass(raw) {
   const m = String(raw || '').match(/(\d)(?:\.(\d))?/);
   if (!m) return null;
@@ -272,9 +273,10 @@ function hazmatRefusal(order) {
     if (p.hazmatIdentificationNumber && PROHIBITED_UN.includes(un)) return label + 'does not carry UN' + un + ' (' + sku + ')';
     if (LITHIUM_UN.includes(un)) return label + 'is not sent lithium batteries (UN' + un + ', ' + sku + ') — no lithium battery mark is printed';
     if (String(p.hazmatTypeName || '').trim().toUpperCase() === 'FR') return label + 'is not sent Fully Regulated hazmat (' + sku + ')';
-    const cls = prohibitedClass(p.hazmatClassDivisionNumber);
+    const aerosol = un === '1950';
+    if (aerosol && !/^\s*2\.[12]\b/.test(String(p.hazmatClassDivisionNumber || ''))) return label + 'needs the aerosol class (2.1 or 2.2) — ' + sku + ' has none set in Logiwa';
+    const cls = !aerosol && prohibitedClass(p.hazmatClassDivisionNumber);
     if (cls) return label + 'does not carry ' + cls + ' (' + sku + ')';
-    if (un === '1950' && !/^\s*2\.2\b/.test(String(p.hazmatClassDivisionNumber || ''))) return label + 'takes Class 2.2 aerosols only — ' + sku + ' has no class set';
     // §2.1 / §2.2: class 9 is carried only as dry ice or batteries in equipment (refused above).
     if (/^\s*9\b/.test(String(p.hazmatClassDivisionNumber || '')) && un !== '1845') return label + 'carries class 9 only as dry ice or batteries in equipment (' + sku + ', UN' + un + ')';
   }
@@ -719,7 +721,9 @@ app.post('/create-label', async (req, res) => {
         postal_code:       shipTo.postalCode || '',
         receiver:          toContact.name  || '',
         receiver_phone:    toContact.phone || '',
-        receiver_email:    toContact.email || '',
+        // No customer email: UniUni sends its own tracking emails to it, and the
+        // brand's store is the one that should talk to the customer.
+        receiver_email:    '',
         delivery_unit_no:  shipTo.address2 || '',
         length:            l,
         width:             w,
