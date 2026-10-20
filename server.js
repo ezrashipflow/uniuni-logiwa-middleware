@@ -275,6 +275,8 @@ function hazmatRefusal(order) {
     const cls = prohibitedClass(p.hazmatClassDivisionNumber);
     if (cls) return label + 'does not carry ' + cls + ' (' + sku + ')';
     if (un === '1950' && !/^\s*2\.2\b/.test(String(p.hazmatClassDivisionNumber || ''))) return label + 'takes Class 2.2 aerosols only — ' + sku + ' has no class set';
+    // §2.1 / §2.2: class 9 is carried only as dry ice or batteries in equipment (refused above).
+    if (/^\s*9\b/.test(String(p.hazmatClassDivisionNumber || '')) && un !== '1845') return label + 'carries class 9 only as dry ice or batteries in equipment (' + sku + ', UN' + un + ')';
   }
   return null;
 }
