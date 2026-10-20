@@ -205,9 +205,12 @@ const DEFAULT_FROM = {
 // (and drop out of Logiwa's rate shop) and no label:
 //   - §2.3  contiguous U.S. only — not Alaska, Hawaii, territories or abroad
 //   - §3.1.4 package over 30 lb
-//   - §2.1  prohibited classes and UN numbers (when Logiwa has them)
-// A hazmat product with no class / UN number in Logiwa is let through: the
-// guide puts classification on the shipper, and we cannot tell from here.
+//   - §2.1  prohibited classes and UN numbers
+//   - an aerosol (UN1950) that isn't class 2.2 — §2.1 lists flammable gases as
+//     prohibited, so a 2.1 or unclassed aerosol stays off UniUni
+// We also refuse what we can't mark or don't vouch for: lithium batteries in
+// equipment (no lithium battery mark is printed here), Fully Regulated items,
+// and a hazmat product with no UN number or class in Logiwa.
 
 const HAZMAT_MAX_LB = 30;
 const NON_CONTIGUOUS = ['AK', 'HI', 'PR', 'GU', 'VI', 'AS', 'MP', 'AA', 'AE', 'AP'];
@@ -263,10 +266,15 @@ function hazmatRefusal(order) {
   }
 
   for (const p of lines) {
+    const sku = p.sku || 'item';
     const un = String(p.hazmatIdentificationNumber || '').replace(/\D/g, '').padStart(4, '0');
-    if (p.hazmatIdentificationNumber && PROHIBITED_UN.includes(un)) return label + 'does not carry UN' + un + ' (' + (p.sku || 'item') + ')';
+    if (!p.hazmatIdentificationNumber && !p.hazmatClassDivisionNumber) return label + 'needs the UN number and class — ' + sku + ' has neither in Logiwa';
+    if (p.hazmatIdentificationNumber && PROHIBITED_UN.includes(un)) return label + 'does not carry UN' + un + ' (' + sku + ')';
+    if (LITHIUM_UN.includes(un)) return label + 'is not sent lithium batteries (UN' + un + ', ' + sku + ') — no lithium battery mark is printed';
+    if (String(p.hazmatTypeName || '').trim().toUpperCase() === 'FR') return label + 'is not sent Fully Regulated hazmat (' + sku + ')';
     const cls = prohibitedClass(p.hazmatClassDivisionNumber);
-    if (cls) return label + 'does not carry ' + cls + ' (' + (p.sku || 'item') + ')';
+    if (cls) return label + 'does not carry ' + cls + ' (' + sku + ')';
+    if (un === '1950' && !/^\s*2\.2\b/.test(String(p.hazmatClassDivisionNumber || ''))) return label + 'takes Class 2.2 aerosols only — ' + sku + ' has no class set';
   }
   return null;
 }
@@ -286,9 +294,33 @@ function hazmatRefusal(order) {
 
 const LITHIUM_UN = ['3481', '3091'];
 
-function needsLimitedQuantityMark(order) {
-  return orderProducts(order).filter(isHazmatLine).some(p =>
-    !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+const SMALL_QTY_TYPES = (process.env.SMALL_QTY_HAZMAT_TYPES || 'EQ')
+  .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+const SMALL_QTY_STATEMENT = 'This package conforms to 49 CFR 173.4 for domestic highway or rail transport only.';
+
+function isSmallQuantityLine(p) {
+  const type = String(p.hazmatTypeName || p.hazmatType || '').trim().toUpperCase();
+  return SMALL_QTY_TYPES.includes(type)
+    || /173\.4\b|small\s+quantit/i.test(p.hazmatShippingName || '');
+}
+
+// Breaks text into lines no wider than `room` at the given size.
+function wrapText(text, measure, room) {
+  const out = [];
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const last = out[out.length - 1];
+    if (last !== undefined && measure(last + ' ' + word) <= room) out[out.length - 1] = last + ' ' + word;
+    else out.push(word);
+  }
+  return out;
+}
+
+// Which mark the order's hazmat takes: 'LQ', 'SQ' or null.
+function hazmatMarkFor(order) {
+  const lines = orderProducts(order).filter(isHazmatLine)
+    .filter(p => !LITHIUM_UN.includes(String(p.hazmatIdentificationNumber || '').replace(/\D/g, '')));
+  if (!lines.length) return null;
+  return lines.every(isSmallQuantityLine) ? 'SQ' : 'LQ';
 }
 
 // The mark as plain geometry, in whatever unit the caller draws in.
@@ -315,10 +347,60 @@ async function lqMarkPdf(pdfBase64, caption) {
   page.drawSvgPath(P([[g.cx, g.cy - g.r], [g.cx + g.r, g.cy], [g.cx, g.cy + g.r], [g.cx - g.r, g.cy]]), { ...at, color: rgb(0, 0, 0) });
   const w = g.ri - g.a;                    // half-width of the white band at its top and bottom
   page.drawSvgPath(P([[g.cx - w, g.cy - g.a], [g.cx + w, g.cy - g.a], [g.cx + g.ri, g.cy], [g.cx + w, g.cy + g.a], [g.cx - w, g.cy + g.a], [g.cx - g.ri, g.cy]]), { ...at, color: rgb(1, 1, 1) });
+  // One caption line per entry, centred; the size drops until the widest fits.
   const font = await doc.embedFont(StandardFonts.HelveticaBold);
-  const size = 14;
-  page.drawText(caption, { x: (W - font.widthOfTextAtSize(caption, size)) / 2, y: 7 * mm, size, font, color: rgb(0, 0, 0) });
+  const room = W - 2 * 4 * mm;
+  let size = 14;
+  while (size > 6 && Math.max(...caption.map(l => font.widthOfTextAtSize(l, size))) > room) size -= 0.5;
+  caption.forEach((line, i) => {
+    const y = 7 * mm + (caption.length - 1 - i) * size * 1.25;
+    page.drawText(line, { x: (W - font.widthOfTextAtSize(line, size)) / 2, y, size, font, color: rgb(0, 0, 0) });
+  });
   return Buffer.from(await doc.save()).toString('base64');
+}
+
+// The Small Quantity page: the 173.4 statement, large and centred, with the
+// order code under it.
+async function sqMarkPdf(pdfBase64, orderCode) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc   = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const { width: W, height: H } = doc.getPage(0).getSize();
+  const page  = doc.addPage([W, H]);
+  const mm    = 72 / 25.4;
+  const font  = await doc.embedFont(StandardFonts.HelveticaBold);
+  const room  = W - 2 * 8 * mm;
+  const size  = 20;
+  const lines = wrapText(SMALL_QTY_STATEMENT, l => font.widthOfTextAtSize(l, size), room);
+  const lead  = size * 1.3;
+  let y = H / 2 + (lines.length * lead) / 2;
+  page.drawRectangle({ x: 5 * mm, y: y - lines.length * lead - 4 * mm, width: W - 10 * mm, height: lines.length * lead + 10 * mm, borderColor: rgb(0, 0, 0), borderWidth: 2 });
+  for (const line of lines) {
+    y -= lead;
+    page.drawText(line, { x: (W - font.widthOfTextAtSize(line, size)) / 2, y: y + lead * 0.25, size, font, color: rgb(0, 0, 0) });
+  }
+  if (orderCode) {
+    let s = 14;
+    while (s > 6 && font.widthOfTextAtSize(orderCode, s) > W - 8 * mm) s -= 0.5;
+    page.drawText(orderCode, { x: (W - font.widthOfTextAtSize(orderCode, s)) / 2, y: 7 * mm, size: s, font, color: rgb(0, 0, 0) });
+  }
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+function sqMarkZpl(label, orderCode) {
+  const plain = String(label).includes('^XA');
+  const zpl   = plain ? String(label) : Buffer.from(String(label), 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  const pw  = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const dpm = pw / 101.6;
+  const W = pw, H = Math.round(pw * 1.5);
+  const clean = s => String(s).replace(/[\^~\\]/g, ' ');
+  const out = ['^XA', '^PW' + W, '^LL' + H, '^LH0,0',
+    '^FO' + Math.round(5 * dpm) + ',' + Math.round(H / 2 - 30 * dpm) + '^GB' + Math.round(W - 10 * dpm) + ',' + Math.round(60 * dpm) + ',' + Math.round(0.7 * dpm) + '^FS',
+    '^FO' + Math.round(8 * dpm) + ',' + Math.round(H / 2 - 24 * dpm) + '^A0N,' + Math.round(7 * dpm) + ',' + Math.round(7 * dpm) + '^FB' + Math.round(W - 16 * dpm) + ',6,' + Math.round(1.5 * dpm) + ',C^FD' + clean(SMALL_QTY_STATEMENT) + '^FS'];
+  if (orderCode) out.push('^FO' + Math.round(4 * dpm) + ',' + Math.round(H - 18 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + Math.round(W - 8 * dpm) + ',2,' + Math.round(dpm) + ',C^FD' + clean(orderCode) + '^FS');
+  out.push('^XZ');
+  const both = zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n';
+  return plain ? both : Buffer.from(both).toString('base64');
 }
 
 function lqMarkZpl(zplBase64, caption) {
@@ -343,13 +425,20 @@ function lqMarkZpl(zplBase64, caption) {
       box(g.cx + hw - bar, y, bar);
     }
   }
-  out.push('^FO0,' + Math.round(H - 14 * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + W + ',1,0,C^FD' + caption.replace(/[\^~\\]/g, ' ') + '^FS', '^XZ');
+  // ^FB wraps inside the label width; \& starts each caption line on its own row.
+  const text = caption.map(l => l.replace(/[\^~\\]/g, ' ')).join('\\&');
+  const lines = caption.length + 1;        // room for one extra wrap of a long order code
+  out.push('^FO' + Math.round(4 * dpm) + ',' + Math.round(H - (6 + 6 * lines) * dpm) + '^A0N,' + Math.round(5 * dpm) + ',' + Math.round(5 * dpm) + '^FB' + Math.round(W - 8 * dpm) + ',' + lines + ',' + Math.round(dpm) + ',C^FD' + text + '^FS', '^XZ');
   return Buffer.from(zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n').toString('base64');
 }
 
-// Shipping label + Limited Quantity mark, same format as the label came in.
-function withLimitedQuantityMark(labelBase64, format, order) {
-  const caption = 'LIMITED QUANTITY - ' + (order.shipmentOrderCode || '');
+// Shipping label + the order's hazmat mark (Limited Quantity diamond, or the
+// 173.4 statement for Small Quantity), same format as the label came in.
+function withLimitedQuantityMark(labelBase64, format, order, mark) {
+  const code = order.shipmentOrderCode || '';
+  if (mark === 'SQ') return format === 'zpl' ? sqMarkZpl(labelBase64, code) : sqMarkPdf(labelBase64, code);
+  // Two lines, so a long order code never runs off the edge of the label.
+  const caption = ['LIMITED QUANTITY', code].filter(Boolean);
   return format === 'zpl' ? lqMarkZpl(labelBase64, caption) : lqMarkPdf(labelBase64, caption);
 }
 
@@ -701,14 +790,16 @@ app.post('/create-label', async (req, res) => {
           labelBase64 = Buffer.from(labelRes.data).toString('base64');
         }
 
-        // Hazmat: print the Limited Quantity mark as a second label after this one.
+        // Hazmat: print the box mark as a second label after this one.
         // The shipping label is already bought, so a failure here must not lose it.
-        if (labelBase64 && needsLimitedQuantityMark(order)) {
+        const mark = labelBase64 && hazmatMarkFor(order);
+        if (mark) {
+          const name = mark === 'SQ' ? 'Small Quantity (49 CFR 173.4) statement' : 'Limited Quantity mark';
           try {
-            labelBase64 = await withLimitedQuantityMark(labelBase64, labelFmt.format, order);
-            console.log('[CREATE-LABEL] Limited Quantity mark added after the shipping label (' + labelFmt.format + ')');
+            labelBase64 = await withLimitedQuantityMark(labelBase64, labelFmt.format, order, mark);
+            console.log('[CREATE-LABEL] ' + name + ' added after the shipping label (' + labelFmt.format + ')');
           } catch (e) {
-            console.warn('[CREATE-LABEL] ⚠ could not add the Limited Quantity mark — apply one by hand: ' + e.message);
+            console.warn('[CREATE-LABEL] ⚠ could not add the ' + name + ' — apply one by hand: ' + e.message);
           }
         }
 
