@@ -565,9 +565,9 @@ async function withOrientationArrows(tag, label, format, order, box) {
 // one more 4x6 after the hazmat mark and arrows, so the packer gets it from
 // the same print.
 //
-// 24-hour emergency contact is CHEMTREC (Ezra 2026-10-21). CHEMTREC
-// registrants show their contract number (CCN) next to the phone number:
-// set HAZMAT_CHEMTREC_CCN. HAZMAT_CERT_SIGNER is the person certifying; the
+// 24-hour emergency contact is the ShipFlow warehouse line (Ezra 2026-10-22,
+// replacing CHEMTREC); HAZMAT_EMERGENCY_CONTACT overrides it. DOT wants this
+// number answered around the clock while the box is in transit. HAZMAT_CERT_SIGNER is the person certifying; the
 // guides take an electronic signature, so the name prints as the signature.
 // Left unset, the name and signature lines print blank to be signed by hand.
 //
@@ -577,8 +577,7 @@ async function withOrientationArrows(tag, label, format, order, box) {
 // Quantity entries get "Ltd Qty" after the shipping name (GOFO guide §5.5 note).
 
 const CERT_CARRIER    = 'UNIUNI';
-const CHEMTREC_PHONE  = '1-800-424-9300';
-const CHEMTREC_CCN    = (process.env.HAZMAT_CHEMTREC_CCN || '').trim();
+const EMERGENCY_CONTACT = (process.env.HAZMAT_EMERGENCY_CONTACT || 'ShipFlow 908-525-3857').trim();
 const CERT_SIGNER     = (process.env.HAZMAT_CERT_SIGNER || '').trim();
 const CERT_PACKAGE    = (process.env.HAZMAT_CERT_PACKAGE_TYPE || 'Fiberboard Box').trim();
 const CERT_STATEMENT  = 'I hereby declare that the contents of this consignment are fully and accurately described above by the Proper Shipping Name, are properly classified, packaged, marked, and labeled, and are in proper condition for transportation according to the applicable regulations of the U.S. Department of Transportation.';
@@ -669,7 +668,7 @@ function certLayout(order, box, trackingNo, measure) {
   rule();
   para('SHIPMENT NO.: ' + (trackingNo || '') + (order.shipmentOrderCode ? '  |  ORDER: ' + order.shipmentOrderCode : ''), 7, true);
   para('SHIPPING DATE: ' + date, 7, false);
-  para('24-HOUR EMERGENCY CONTACT: CHEMTREC ' + CHEMTREC_PHONE + (CHEMTREC_CCN ? ' | CCN ' + CHEMTREC_CCN : ''), 7, true);
+  para('24-HOUR EMERGENCY CONTACT: ' + EMERGENCY_CONTACT, 7, true);
   rule();
   para('HAZARDOUS MATERIAL DESCRIPTION', 6.5, true);
   para('Package: 1 ' + CERT_PACKAGE, 7, false);
@@ -744,7 +743,7 @@ async function withHazmatCertification(tag, label, format, order, box, trackingN
     if (fmt.includes('zpl')) out = certZpl(label, order, box, trackingNo);
     else if (fmt.includes('pdf')) out = await certPdf(label, order, box, trackingNo);
     else throw new Error('cannot add a label to ' + (format || 'unknown') + ' format');
-    console.log('[' + tag + '] hazmat certification added (' + fmt + ')' + (CERT_SIGNER ? '' : ' — no HAZMAT_CERT_SIGNER, sign by hand') + (CHEMTREC_CCN ? '' : ' — no HAZMAT_CHEMTREC_CCN'));
+    console.log('[' + tag + '] hazmat certification added (' + fmt + ')' + (CERT_SIGNER ? '' : ' — no HAZMAT_CERT_SIGNER, sign by hand'));
     return out;
   } catch (e) {
     console.warn('[' + tag + '] ⚠ could not add the hazmat certification — attach one by hand: ' + e.message);
