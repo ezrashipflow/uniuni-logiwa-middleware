@@ -128,9 +128,10 @@ function getContact(obj) {
   if (!obj) return {};
   const c = obj.contact || obj;
   return {
-    name:  c.personName   || c.name    || '',
-    phone: c.phoneNumber  || c.phone   || '',
-    email: c.emailAddress || c.email   || '',
+    name:    c.personName   || c.name    || '',
+    company: c.companyName  || c.company || '',
+    phone:   c.phoneNumber  || c.phone   || '',
+    email:   c.emailAddress || c.email   || '',
   };
 }
 
@@ -557,6 +558,199 @@ async function withOrientationArrows(tag, label, format, order, box) {
   }
 }
 
+// ─── HAZMAT SHIPPING CERTIFICATION ───────────────────────────────────────────
+// Every hazmat box needs shipping papers in the carrier's own "Hazardous
+// Materials Shipping Certification" format, signed and attached near the
+// address label (GOFO and UniUni guides §5.2–5.5, Appendix D). We print it as
+// one more 4x6 after the hazmat mark and arrows, so the packer gets it from
+// the same print.
+//
+// 24-hour emergency contact is the ShipFlow warehouse line (Ezra 2026-10-22,
+// replacing CHEMTREC); HAZMAT_EMERGENCY_CONTACT overrides it. DOT wants this
+// number answered around the clock while the box is in transit. HAZMAT_CERT_SIGNER is the person certifying; the
+// guides take an electronic signature, so the name prints as the signature.
+// Left unset, the name and signature lines print blank to be signed by hand.
+//
+// Logiwa has no packing group field, so a packing group is shown only when the
+// shipping name carries one ("... PG II"). Products have no net hazmat
+// quantity in Logiwa today, so the total falls back to gross weight. Limited
+// Quantity entries get "Ltd Qty" after the shipping name (GOFO guide §5.5 note).
+
+const CERT_CARRIER    = 'UNIUNI';
+const EMERGENCY_CONTACT = (process.env.HAZMAT_EMERGENCY_CONTACT || 'ShipFlow 908-525-3857').trim();
+const CERT_SIGNER     = (process.env.HAZMAT_CERT_SIGNER || '').trim();
+const CERT_PACKAGE    = (process.env.HAZMAT_CERT_PACKAGE_TYPE || 'Fiberboard Box').trim();
+const CERT_STATEMENT  = 'I hereby declare that the contents of this consignment are fully and accurately described above by the Proper Shipping Name, are properly classified, packaged, marked, and labeled, and are in proper condition for transportation according to the applicable regulations of the U.S. Department of Transportation.';
+
+// The box's hazmat, one entry per UN number + shipping name + class.
+function certEntries(order, box) {
+  const own   = box && Array.isArray(box.products) && box.products.length ? box.products : null;
+  const lines = (own || orderProducts(order)).filter(isHazmatLine);
+  const byKey = new Map();
+  for (const p of lines) {
+    const un   = String(p.hazmatIdentificationNumber || '').replace(/\D/g, '');
+    const cls  = (String(p.hazmatClassDivisionNumber || '').match(/\d(\.\d)?/) || [''])[0];
+    let name   = String(p.hazmatShippingName || '').trim() || p.description || p.sku || 'Unknown';
+    const pg   = (name.match(/\bPG\s*(III|II|I)\b/i) || [])[1];
+    if (pg) name = name.replace(/[,\s]*\bPG\s*(III|II|I)\b/i, '').trim();
+    const kind = LITHIUM_UN.includes(un) ? 'LI' : isSmallQuantityLine(p) ? 'SQ' : 'LQ';
+    const key  = [un, name.toLowerCase(), cls, kind].join('|');
+    const qty  = Number(p.quantity) || 1;
+    const e = byKey.get(key) || { un, name, cls, pg: pg ? pg.toUpperCase() : '', kind, units: 0, netQty: 0, netUnit: '', allNet: true, grossLb: 0 };
+    e.units += qty;
+    const netQ = Number(p.hazmatQuantity);
+    if (netQ > 0 && p.hazmatQuantityUnitType) { e.netQty += netQ * qty; e.netUnit = p.hazmatQuantityUnitType; }
+    else e.allNet = false;
+    e.grossLb += (weightToLB(p.weight, p.weightUnit) || 0) * qty;
+    byKey.set(key, e);
+  }
+  return [...byKey.values()];
+}
+
+function certDescription(e) {
+  const ltd  = e.kind === 'LQ' && !/\b(ltd\.?\s*qty|limited\s+quantit)/i.test(e.name) ? ', Ltd Qty' : '';
+  return [(e.un ? 'UN' + e.un : 'UN?') + ', ' + e.name + ltd, e.cls || '?', e.pg ? 'PG ' + e.pg : null].filter(Boolean).join(', ');
+}
+
+function certQuantity(e) {
+  if (e.allNet && e.netQty > 0) return (Math.round(e.netQty * 100) / 100) + ' ' + e.netUnit + ' (Net)';
+  return (e.grossLb > 0 ? Math.round(e.grossLb * 100) / 100 : '?') + ' lb (Gross)';
+}
+
+const CERT_LABELS = { LQ: 'Limited Quantity Mark', SQ: 'None - 49 CFR 173.4', LI: 'Lithium Battery Mark' };
+
+// Lays the page out as text and rule operations in points on a 4x6 portrait
+// page (288 x 432, y down). `measure(text, size, bold)` is the width of a line;
+// a page that fills up continues on another 4x6.
+function certLayout(order, box, trackingNo, measure) {
+  const W = 288, H = 432, M = 12, room = W - 2 * M;
+  const ops = [];
+  let page = 0, y = M;
+  const ascii = s => String(s || '').replace(/[§]/g, '').replace(/[–—]/g, '-').replace(/[^\x20-\x7E]/g, '');
+  const need = (h) => { if (y + h > H - M) { page++; y = M; } };
+  const wrap = (text, size, bold, width) => wrapText(ascii(text), l => measure(l, size, bold), width);
+  const para = (text, size, bold, opts = {}) => {
+    for (const line of wrap(text, size, bold, opts.width || room)) {
+      need(size * 1.2);
+      const w = measure(line, size, bold);
+      ops.push({ kind: 'text', page, x: opts.center ? (W - w) / 2 : (opts.x ?? M), y, size, bold, text: line });
+      y += size * 1.2;
+    }
+  };
+  const rule = (t = 1) => { need(6); y += 2; ops.push({ kind: 'rule', page, x: M, y, w: room, h: t }); y += t + 3; };
+  // Two blocks side by side; y moves past the taller one.
+  const columns = (left, right) => {
+    const half = (room - 8) / 2, top = y, startPage = page;
+    const run = (rows, x) => {
+      page = startPage; y = top;
+      for (const [text, size, bold] of rows) para(text, size, bold, { x, width: half });
+      return { page, y };
+    };
+    const a = run(left, M), b = run(right, M + half + 8);
+    if (a.page !== b.page) { page = Math.max(a.page, b.page); y = a.page > b.page ? a.y : b.y; }
+    else { page = a.page; y = Math.max(a.y, b.y); }
+  };
+
+  const from = getAddr(order.shipFrom), fromC = getContact(order.shipFrom);
+  const to   = getAddr(order.shipTo),   toC   = getContact(order.shipTo);
+  const place = a => [[a.city, a.state].filter(Boolean).join(', '), a.postalCode, a.country].filter(Boolean).join(' ');
+  const party = (title, c, a) => [[title, 6.5, true], [c.company || c.name, 7, true],
+    ...(c.company && c.name && c.company !== c.name ? [[c.name, 7, false]] : []),
+    [[a.address1, a.address2].filter(Boolean).join(', '), 7, false], [place(a), 7, false],
+    ...(c.phone ? [['Phone: ' + c.phone, 7, false]] : [])];
+  const entries = certEntries(order, box);
+  const date = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric' });
+
+  para(CERT_CARRIER + ' HAZARDOUS MATERIALS SHIPPING CERTIFICATION', 9.5, true, { center: true });
+  para('49 CFR 172.200-172.204 - Ground Transportation Only', 6.5, false, { center: true });
+  rule(1.5);
+  columns(party('SHIPPER', fromC, from), party('CONSIGNEE', toC, to));
+  rule();
+  para('SHIPMENT NO.: ' + (trackingNo || '') + (order.shipmentOrderCode ? '  |  ORDER: ' + order.shipmentOrderCode : ''), 7, true);
+  para('SHIPPING DATE: ' + date, 7, false);
+  para('24-HOUR EMERGENCY CONTACT: ' + EMERGENCY_CONTACT, 7, true);
+  rule();
+  para('HAZARDOUS MATERIAL DESCRIPTION', 6.5, true);
+  para('Package: 1 ' + CERT_PACKAGE, 7, false);
+  for (const e of entries) {
+    y += 2;
+    para(certDescription(e), 8, true);
+    para('Label(s): ' + CERT_LABELS[e.kind] + '  |  Total: ' + certQuantity(e) + '  |  ' + e.units + ' unit' + (e.units === 1 ? '' : 's'), 6.5, false);
+  }
+  y += 3;
+  const has = k => entries.some(e => e.kind === k) ? '[X]' : '[  ]';
+  para(has('LQ') + ' Limited Quantity (49 CFR 173.150 / applicable section)', 6.5, false);
+  para(has('SQ') + ' Small Quantity (49 CFR 173.4)', 6.5, false);
+  para(has('LI') + ' Lithium Batteries (49 CFR 173.185)', 6.5, false);
+  rule();
+  para('SHIPPER CERTIFICATION (49 CFR 172.204)', 6.5, true);
+  para(CERT_STATEMENT, 6, false);
+  y += 4;
+  para('Name (Print): ' + (CERT_SIGNER || '______________________________'), 7.5, false);
+  para('Signature: ' + (CERT_SIGNER ? '/s/ ' + CERT_SIGNER : '_________________________________'), 7.5, !!CERT_SIGNER);
+  para('Date: ' + date, 7.5, false);
+  return { ops, pages: page + 1 };
+}
+
+async function certPdf(pdfBase64, order, box, trackingNo) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc   = await PDFDocument.load(Buffer.from(pdfBase64, 'base64'));
+  const { width: PW, height: PH } = doc.getPage(0).getSize();
+  const reg   = await doc.embedFont(StandardFonts.Helvetica);
+  const bold  = await doc.embedFont(StandardFonts.HelveticaBold);
+  const k     = PW / 288;                  // the carrier's page may not be exactly 4x6 points
+  const { ops, pages } = certLayout(order, box, trackingNo, (t, s, b) => (b ? bold : reg).widthOfTextAtSize(t, s));
+  const added = Array.from({ length: pages }, () => doc.addPage([PW, PH]));
+  for (const o of ops) {
+    const pg = added[o.page];
+    if (o.kind === 'rule') pg.drawRectangle({ x: o.x * k, y: PH - (o.y + o.h) * k, width: o.w * k, height: o.h * k, color: rgb(0, 0, 0) });
+    else pg.drawText(o.text, { x: o.x * k, y: PH - (o.y + o.size * 0.85) * k, size: o.size * k, font: o.bold ? bold : reg, color: rgb(0, 0, 0) });
+  }
+  return Buffer.from(await doc.save()).toString('base64');
+}
+
+function certZpl(label, order, box, trackingNo) {
+  const plain = String(label).includes('^XA');
+  const zpl   = plain ? String(label) : Buffer.from(String(label), 'base64').toString('utf8');
+  if (!zpl.includes('^XA')) throw new Error('label is not ZPL text');
+  const pw = parseInt((zpl.match(/\^PW(\d+)/) || [])[1], 10) || 812;
+  const k  = pw / 288;                     // dots per point on a 4-inch-wide label
+  // Font 0 is proportional; 0.6 of the height per character never under-measures.
+  const { ops, pages } = certLayout(order, box, trackingNo, (t, s) => t.length * s * 0.6);
+  const out = [];
+  for (let p = 0; p < pages; p++) {
+    out.push('^XA', '^PW' + pw, '^LL' + Math.round(432 * k), '^LH0,0');
+    for (const o of ops.filter(op => op.page === p)) {
+      if (o.kind === 'rule') out.push('^FO' + Math.round(o.x * k) + ',' + Math.round(o.y * k) + '^GB' + Math.round(o.w * k) + ',' + Math.max(Math.round(o.h * k), 2) + ',' + Math.max(Math.round(o.h * k), 2) + '^FS');
+      else {
+        const h = Math.round(o.size * k * (o.bold ? 1.05 : 1));
+        out.push('^FO' + Math.round(o.x * k) + ',' + Math.round(o.y * k) + '^A0N,' + h + ',' + h + '^FD' + o.text.replace(/[\^~\\]/g, ' ') + '^FS');
+      }
+    }
+    out.push('^XZ');
+  }
+  const all = zpl.replace(/\s+$/, '') + '\n' + out.join('\n') + '\n';
+  return plain ? all : Buffer.from(all).toString('base64');
+}
+
+// The label with the signed hazmat certification added after it. The shipping
+// label is already bought by now, so any failure hands the label back as it was.
+async function withHazmatCertification(tag, label, format, order, box, trackingNo) {
+  if (!label || !certEntries(order, box).length) return label;
+  const fmt = String(format || '').toLowerCase();
+  try {
+    let out;
+    if (fmt.includes('zpl')) out = certZpl(label, order, box, trackingNo);
+    else if (fmt.includes('pdf')) out = await certPdf(label, order, box, trackingNo);
+    else throw new Error('cannot add a label to ' + (format || 'unknown') + ' format');
+    console.log('[' + tag + '] hazmat certification added (' + fmt + ')' + (CERT_SIGNER ? '' : ' — no HAZMAT_CERT_SIGNER, sign by hand'));
+    return out;
+  } catch (e) {
+    console.warn('[' + tag + '] ⚠ could not add the hazmat certification — attach one by hand: ' + e.message);
+    return label;
+  }
+}
+
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
 
 async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
@@ -920,6 +1114,7 @@ app.post('/create-label', async (req, res) => {
           }
         }
         labelBase64 = await withOrientationArrows('CREATE-LABEL', labelBase64, labelFmt.format, order, null);
+        labelBase64 = await withHazmatCertification('CREATE-LABEL', labelBase64, labelFmt.format, order, null, tno);
 
         labelCache[tno] = {
           labelData: labelBase64,
