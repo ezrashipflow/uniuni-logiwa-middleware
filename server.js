@@ -751,6 +751,55 @@ async function withHazmatCertification(tag, label, format, order, box, trackingN
   }
 }
 
+// ─── UNSERVICEABLE ADDRESSES ──────────────────────────────────────────────────
+// UniUni's rate call only looks at ZIP codes. It refuses some street addresses
+// inside ZIPs it serves ("remote mountain area", "government restricted area",
+// "an area that is currently not serviceable") only when the label is booked.
+// A refused address is remembered for BLOCK_DAYS so the next rate shop leaves
+// UniUni out and Logiwa picks another carrier. A label that later books fine
+// for the address removes it. Kept on the Railway volume so it survives deploys.
+const fs   = require('fs');
+const path = require('path');
+const BLOCK_DAYS = parseInt(process.env.UNIUNI_BLOCK_DAYS, 10) || 60;
+const BLOCK_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname, 'unserviceable-addresses.json');
+const UNSERVICEABLE_RE = /currently not serviceable/i;
+
+let blocked = {};
+try { blocked = JSON.parse(fs.readFileSync(BLOCK_FILE, 'utf8')); } catch (e) { blocked = {}; }
+
+function saveBlocked() {
+  try { fs.writeFileSync(BLOCK_FILE, JSON.stringify(blocked)); }
+  catch (e) { console.error('[BLOCKED] could not save ' + BLOCK_FILE + ': ' + e.message); }
+}
+
+// Street line + 5-digit ZIP; the apartment line is left out.
+function addressKey(addr) {
+  const street = String(addr.address1 || '').toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const zip    = String(addr.postalCode || '').replace(/[^0-9]/g, '').slice(0, 5);
+  return street && zip ? street + '|' + zip : null;
+}
+
+function blockedEntry(addr) {
+  const key = addressKey(addr);
+  const e   = key && blocked[key];
+  if (!e) return null;
+  if (Date.now() - e.at > BLOCK_DAYS * 86400000) { delete blocked[key]; saveBlocked(); return null; }
+  return e;
+}
+
+function rememberUnserviceable(addr, reason, orderCode) {
+  const key = addressKey(addr);
+  if (!key) return;
+  blocked[key] = { at: Date.now(), reason, order: orderCode };
+  saveBlocked();
+  console.log('[BLOCKED] remembered ' + key + ' for ' + BLOCK_DAYS + ' days — ' + reason);
+}
+
+function forgetUnserviceable(addr) {
+  const key = addressKey(addr);
+  if (key && blocked[key]) { delete blocked[key]; saveBlocked(); console.log('[BLOCKED] cleared ' + key + ' — UniUni booked it'); }
+}
+
 // ─── RATE LOOKUP HELPER ───────────────────────────────────────────────────────
 
 async function getRateAmount(token, shipFromPostal, shipToPostal, weightLB, dims) {
@@ -797,6 +846,7 @@ app.get('/', (req, res) => res.json({
   service: 'UniUni <-> Logiwa Middleware',
   version: '1.1.0',
   warehouse_id: UNIUNI_WAREHOUSE_ID || 'NOT SET',
+  unserviceable_addresses: Object.keys(blocked).length,
 }));
 
 // ─── LABEL PROXY ──────────────────────────────────────────────────────────────
@@ -864,6 +914,20 @@ app.post('/get-rate', async (req, res) => {
           rateList:     [],
           isSuccessful: false,
           message:      [refusal],
+        });
+        continue;
+      }
+
+      const known = blockedEntry(getAddr(order.shipTo));
+      if (known) {
+        const why = 'UniUni refused this address on ' + new Date(known.at).toISOString().slice(0, 10) + ': ' + known.reason;
+        console.log('[GET-RATE] BLOCKED ' + order.shipmentOrderCode + ' — ' + why);
+        out.push({
+          shipmentOrderCode:       order.shipmentOrderCode,
+          shipmentOrderIdentifier: order.shipmentOrderIdentifier,
+          rateList:     [],
+          isSuccessful: false,
+          message:      [why],
         });
         continue;
       }
@@ -1055,6 +1119,7 @@ app.post('/create-label', async (req, res) => {
 
         const d = shipRes.data;
         if (d.status !== 'SUCCESS') throw new Error(d.ret_msg || 'UniUni order creation failed');
+        forgetUnserviceable(shipTo);
 
         const tno      = d.data.tno;
         const order_id = d.data.order_id;
@@ -1160,6 +1225,7 @@ app.post('/create-label', async (req, res) => {
       } catch (e) {
         logError('CREATE-LABEL', e);
         const em = e.response?.data?.ret_msg || e.message;
+        if (UNSERVICEABLE_RE.test(em)) rememberUnserviceable(getAddr(order.shipTo), em, order.shipmentOrderCode);
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
           shipmentOrderCode:       order.shipmentOrderCode,
