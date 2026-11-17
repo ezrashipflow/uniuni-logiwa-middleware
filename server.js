@@ -49,28 +49,29 @@ let tokenExpiry = 0;
 // ─── LOGGING ──────────────────────────────────────────────────────────────────
 // Carrier API calls only — no full Logiwa payload dumps (causes Railway log rate limit)
 
+// Full UniUni bodies only with LOG_BODIES=1. They carry customer names and addresses, and at dozens of
+// lines per call they hit Railway's 500 lines/sec limit on busy days (Nov 2026: hundreds of lines dropped,
+// errors included). Each call is now one line; errors always log UniUni's answer, on one line.
+const LOG_BODIES = process.env.LOG_BODIES === '1';
+
 function logRequest(tag, method, url, body) {
-  console.log('\n' + '─'.repeat(60));
-  console.log('[' + tag + '] ► REQUEST  ' + method + ' ' + url);
-  if (body) console.log('[' + tag + ']   BODY:\n' + JSON.stringify(body, null, 2));
+  console.log('[' + tag + '] > ' + method + ' ' + url);
+  if (LOG_BODIES && body) console.log('[' + tag + ']   BODY: ' + JSON.stringify(body));
 }
 
 function logResponse(tag, status, data) {
-  console.log('[' + tag + '] ◄ RESPONSE status=' + status);
-  const body = JSON.stringify(data, null, 2);
-  console.log('[' + tag + ']   BODY:\n' + body.slice(0, 1000) + (body.length > 1000 ? '\n...[truncated]' : ''));
-  console.log('─'.repeat(60) + '\n');
+  const d = data && typeof data === 'object' ? data : {};
+  const note = [d.status, d.code, d.ret_msg || d.message || d.msg].filter((x) => x != null && x !== '').join(' ').slice(0, 300);
+  console.log('[' + tag + '] < status=' + status + (note ? ' ' + note : ''));
+  if (LOG_BODIES) console.log('[' + tag + ']   BODY: ' + JSON.stringify(data).slice(0, 2000));
 }
 
 function logError(tag, error) {
-  console.error('[' + tag + '] ✗ ERROR');
   if (error.response) {
-    console.error('[' + tag + ']   HTTP STATUS : ' + error.response.status);
-    console.error('[' + tag + ']   RESPONSE BODY:\n' + JSON.stringify(error.response.data, null, 2));
+    console.error('[' + tag + '] ERROR HTTP ' + error.response.status + ' ' + JSON.stringify(error.response.data).slice(0, 2000));
   } else {
-    console.error('[' + tag + ']   MESSAGE: ' + error.message);
+    console.error('[' + tag + '] ERROR ' + error.message);
   }
-  console.error('─'.repeat(60) + '\n');
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
