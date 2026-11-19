@@ -53,16 +53,20 @@ let tokenExpiry = 0;
 // lines per call they hit Railway's 500 lines/sec limit on busy days (Nov 2026: hundreds of lines dropped,
 // errors included). Each call is now one line; errors always log UniUni's answer, on one line.
 const LOG_BODIES = process.env.LOG_BODIES === '1';
+// Raw UniUni call lines, label byte sizes and cache notes only with LOG_VERBOSE=1. Everything useful (price,
+// zone, days, postage, format, hazmat, tracking, warnings) is always logged.
+const LOG_VERBOSE = process.env.LOG_VERBOSE === '1' || LOG_BODIES;
+const dbg = (...a) => { if (LOG_VERBOSE) console.log(...a); };
 
 function logRequest(tag, method, url, body) {
-  console.log('[' + tag + '] > ' + method + ' ' + url);
+  dbg('[' + tag + '] > ' + method + ' ' + url);
   if (LOG_BODIES && body) console.log('[' + tag + ']   BODY: ' + JSON.stringify(body));
 }
 
 function logResponse(tag, status, data) {
   const d = data && typeof data === 'object' ? data : {};
   const note = [d.status, d.code, d.ret_msg || d.message || d.msg].filter((x) => x != null && x !== '').join(' ').slice(0, 300);
-  console.log('[' + tag + '] < status=' + status + (note ? ' ' + note : ''));
+  dbg('[' + tag + '] < status=' + status + (note ? ' ' + note : ''));
   if (LOG_BODIES) console.log('[' + tag + ']   BODY: ' + JSON.stringify(data).slice(0, 2000));
 }
 
@@ -859,7 +863,7 @@ app.get('/label/:id', (req, res) => {
     return res.status(404).json({ error: 'Label not found', id: req.params.id });
   }
   const buf = Buffer.from(cached.labelData, 'base64');
-  console.log('[LABEL-PROXY] Serving label id=' + req.params.id + ' format=' + cached.format + ' size=' + buf.length + ' bytes');
+  dbg('[LABEL-PROXY] Serving label id=' + req.params.id + ' format=' + cached.format + ' size=' + buf.length + ' bytes');
   res.setHeader('Content-Type', cached.mimeType || 'application/pdf');
   res.setHeader('Content-Disposition', 'inline; filename="' + req.params.id + '.' + (cached.format || 'pdf') + '"');
   res.send(buf);
@@ -999,7 +1003,7 @@ app.post('/get-rate', async (req, res) => {
     }
 
     const logiwaResponse = { data: [out[0]] };
-    console.log('[GET-RATE] → Response to Logiwa: ' + (out[0]?.rateList?.length || 0) + ' rates for ' + out[0]?.shipmentOrderCode);
+    dbg('[GET-RATE] → Response to Logiwa: ' + (out[0]?.rateList?.length || 0) + ' rates for ' + out[0]?.shipmentOrderCode);
     return res.json(logiwaResponse);
 
   } catch (err) {
@@ -1143,7 +1147,7 @@ app.post('/create-label', async (req, res) => {
             responseType: labelFmt.responseType,
           }
         );
-        console.log('[CREATE-LABEL:PRINT] Label fetched → format=' + labelFmt.format + ' size=' + (labelRes.data?.byteLength || JSON.stringify(labelRes.data).length) + ' bytes');
+        dbg('[CREATE-LABEL:PRINT] Label fetched → format=' + labelFmt.format + ' size=' + (labelRes.data?.byteLength || JSON.stringify(labelRes.data).length) + ' bytes');
 
         // Extract base64 label data — PDF comes back as arraybuffer, ZPL as JSON with base64
         let labelBase64;
@@ -1156,7 +1160,7 @@ app.post('/create-label', async (req, res) => {
           labelBase64 = typeof zplRaw === 'string'
             ? zplRaw  // already base64
             : Buffer.from(JSON.stringify(zplRaw)).toString('base64');
-          console.log('[CREATE-LABEL:PRINT] ZPL base64 length=' + labelBase64.length);
+          dbg('[CREATE-LABEL:PRINT] ZPL base64 length=' + labelBase64.length);
           if (!labelBase64) {
             const shape = labelRes.data && typeof labelRes.data === 'object'
               ? Object.entries(labelRes.data).map(([k, v]) => k + ':' + (v && typeof v === 'object' ? '{' + Object.keys(v).join(',') + '}' : typeof v)).join(' ')
@@ -1188,10 +1192,10 @@ app.post('/create-label', async (req, res) => {
           mimeType:  labelFmt.mimeType,
           order_id,
         };
-        console.log('[CREATE-LABEL] Label cached → key=' + tno + ' format=' + labelFmt.format);
+        dbg('[CREATE-LABEL] Label cached → key=' + tno + ' format=' + labelFmt.format);
 
         const proxyLabelUrl = MIDDLEWARE_URL + '/label/' + tno;
-        console.log('[CREATE-LABEL] SUCCESS tracking=' + tno + ' cost=$' + postageAmount + ' format=' + labelFmt.format + ' labelUrl=' + proxyLabelUrl);
+        console.log('[CREATE-LABEL] SUCCESS ' + order.shipmentOrderCode + ' tracking=' + tno + ' cost=$' + postageAmount + ' format=' + labelFmt.format + ' labelUrl=' + proxyLabelUrl);
 
         out.push({
           shipmentOrderIdentifier: order.shipmentOrderIdentifier,
@@ -1242,7 +1246,7 @@ app.post('/create-label', async (req, res) => {
     }
 
     const logiwaResponse = { data: [out[0]] };
-    console.log('[CREATE-LABEL] → Response to Logiwa: tracking=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
+    dbg('[CREATE-LABEL] → Response to Logiwa: tracking=' + out[0]?.masterTrackingNumber + ' success=' + out[0]?.isSuccessful);
     return res.json(logiwaResponse);
 
   } catch (err) {
