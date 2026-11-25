@@ -1152,8 +1152,12 @@ app.post('/create-label', async (req, res) => {
         // Extract base64 label data — PDF comes back as arraybuffer, ZPL as JSON with base64
         let labelBase64;
         if (labelFmt.format === 'zpl') {
-          // UniUni returns ZPL wrapped in JSON — try common response shapes
-          const zplRaw = labelRes.data?.data?.label
+          // UniUni returns the ZPL as plain text (checked 2026-11-24: body starts "^XA"),
+          // so encode it. Older JSON-wrapped shapes are still handled below.
+          const raw = labelRes.data;
+          const zplRaw = (typeof raw === 'string' && raw.includes('^XA'))
+            ? Buffer.from(raw, 'utf8').toString('base64')
+            : labelRes.data?.data?.label
             || labelRes.data?.label
             || labelRes.data?.data
             || '';
