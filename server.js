@@ -767,7 +767,12 @@ const fs   = require('fs');
 const path = require('path');
 const BLOCK_DAYS = parseInt(process.env.UNIUNI_BLOCK_DAYS, 10) || 60;
 const BLOCK_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname, 'unserviceable-addresses.json');
-const UNSERVICEABLE_RE = /currently not serviceable/i;
+// Nov 18–25: besides "not serviceable" areas, UniUni refused PO Boxes (19), addresses it calls incorrect /
+// incomplete (9), ZIPs that don't match the street (4) and unsupported address types — each one quoted
+// first and refused at the label. All of these are now remembered too, and PO Boxes are never quoted.
+const UNSERVICEABLE_RE = /currently not serviceable|po box not supported|appears to be incorrect or incomplete|postal code does not match|address type: .* is not supported/i;
+const PO_BOX_RE = /\b(?:p\s*\.?\s*o\s*\.?\s*(?:box|bx)|post\s*office\s*box|pobox)\b/i;
+const isPoBox = (addr) => PO_BOX_RE.test(String(addr.address1 || '') + ' ' + String(addr.address2 || ''));
 
 let blocked = {};
 try { blocked = JSON.parse(fs.readFileSync(BLOCK_FILE, 'utf8')); } catch (e) { blocked = {}; }
@@ -923,9 +928,9 @@ app.post('/get-rate', async (req, res) => {
         continue;
       }
 
-      const known = blockedEntry(getAddr(order.shipTo));
+      const known = isPoBox(getAddr(order.shipTo)) ? { poBox: true } : blockedEntry(getAddr(order.shipTo));
       if (known) {
-        const why = 'UniUni refused this address on ' + new Date(known.at).toISOString().slice(0, 10) + ': ' + known.reason;
+        const why = known.poBox ? 'UniUni does not deliver to PO Boxes' : 'UniUni refused this address on ' + new Date(known.at).toISOString().slice(0, 10) + ': ' + known.reason;
         console.log('[GET-RATE] BLOCKED ' + order.shipmentOrderCode + ' — ' + why);
         out.push({
           shipmentOrderCode:       order.shipmentOrderCode,
